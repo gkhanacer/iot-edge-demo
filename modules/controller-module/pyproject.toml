@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "controller-module"
+version = "0.1.0"
+description = "IoT Edge controller module — telemetry aggregation and grid balancing"
+authors = []
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+azure-iot-device = "2.14.0"
+structlog = ">=24.0"
+asyncio-mqtt = ">=0.16"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+pytest-asyncio = ">=0.23"
+pytest-cov = ">=5.0"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

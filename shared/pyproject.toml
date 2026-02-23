@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "iot-edge-base"
+version = "0.1.0"
+description = "Shared base classes for IoT Edge modules"
+authors = []
+packages = [{ include = "iot_edge_base" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+structlog = ">=24.0"
+pydantic = ">=2.0"
+asyncio-mqtt = ">=0.16"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

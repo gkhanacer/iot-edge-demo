@@ -1,0 +1,148 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2020-09-01/deploymentTemplate.json#",
+  "modulesContent": {
+    "$edgeAgent": {
+      "properties.desired": {
+        "schemaVersion": "1.1",
+        "runtime": {
+          "type": "docker",
+          "settings": {
+            "minDockerVersion": "v1.25",
+            "loggingOptions": "",
+            "registryCredentials": {
+              "acr": {
+                "username": "$CONTAINER_REGISTRY_USERNAME",
+                "password": "$CONTAINER_REGISTRY_PASSWORD",
+                "address": "$CONTAINER_REGISTRY_ADDRESS"
+              }
+            }
+          }
+        },
+        "systemModules": {
+          "edgeAgent": {
+            "type": "docker",
+            "settings": {
+              "image": "mcr.microsoft.com/azureiotedge-agent:1.4",
+              "createOptions": {}
+            }
+          },
+          "edgeHub": {
+            "type": "docker",
+            "status": "running",
+            "restartPolicy": "always",
+            "settings": {
+              "image": "mcr.microsoft.com/azureiotedge-hub:1.4",
+              "createOptions": {
+                "HostConfig": {
+                  "PortBindings": {
+                    "5671/tcp": [{ "HostPort": "5671" }],
+                    "8883/tcp": [{ "HostPort": "8883" }],
+                    "443/tcp": [{ "HostPort": "443" }]
+                  }
+                }
+              }
+            },
+            "env": {
+              "OptimizeForPerformance": { "value": "true" }
+            }
+          }
+        },
+        "modules": {
+          "solar-module": {
+            "version": "1.0",
+            "type": "docker",
+            "status": "running",
+            "restartPolicy": "always",
+            "settings": {
+              "image": "$CONTAINER_REGISTRY_ADDRESS/solar-module:$MODULE_VERSION",
+              "createOptions": {}
+            },
+            "env": {
+              "ASSET_ID": { "value": "solar-01" },
+              "MAX_POWER_KW": { "value": "100.0" },
+              "TELEMETRY_INTERVAL_S": { "value": "10" }
+            }
+          },
+          "battery-module": {
+            "version": "1.0",
+            "type": "docker",
+            "status": "running",
+            "restartPolicy": "always",
+            "settings": {
+              "image": "$CONTAINER_REGISTRY_ADDRESS/battery-module:$MODULE_VERSION",
+              "createOptions": {}
+            },
+            "env": {
+              "ASSET_ID": { "value": "battery-01" },
+              "CAPACITY_KWH": { "value": "500.0" },
+              "MAX_POWER_KW": { "value": "100.0" },
+              "TELEMETRY_INTERVAL_S": { "value": "10" }
+            }
+          },
+          "boiler-module": {
+            "version": "1.0",
+            "type": "docker",
+            "status": "running",
+            "restartPolicy": "always",
+            "settings": {
+              "image": "$CONTAINER_REGISTRY_ADDRESS/boiler-module:$MODULE_VERSION",
+              "createOptions": {}
+            },
+            "env": {
+              "ASSET_ID": { "value": "boiler-01" },
+              "MAX_POWER_KW": { "value": "200.0" },
+              "DEFAULT_TARGET_C": { "value": "80.0" },
+              "TELEMETRY_INTERVAL_S": { "value": "10" }
+            }
+          },
+          "controller-module": {
+            "version": "1.0",
+            "type": "docker",
+            "status": "running",
+            "restartPolicy": "always",
+            "settings": {
+              "image": "$CONTAINER_REGISTRY_ADDRESS/controller-module:$MODULE_VERSION",
+              "createOptions": {}
+            },
+            "env": {
+              "REPORTING_INTERVAL_S": { "value": "30" },
+              "SURPLUS_THRESHOLD_KW": { "value": "10.0" },
+              "SOLAR_MODULE_ID": { "value": "solar-module" },
+              "BATTERY_MODULE_ID": { "value": "battery-module" },
+              "BOILER_MODULE_ID": { "value": "boiler-module" }
+            }
+          },
+          "telemetry-module": {
+            "version": "1.0",
+            "type": "docker",
+            "status": "running",
+            "restartPolicy": "always",
+            "settings": {
+              "image": "$CONTAINER_REGISTRY_ADDRESS/telemetry-module:$MODULE_VERSION",
+              "createOptions": {}
+            },
+            "env": {
+              "AZURE_MONITOR_CONNECTION_STRING": { "value": "$AZURE_MONITOR_CONNECTION_STRING" },
+              "EXPORT_INTERVAL_MS": { "value": "30000" }
+            }
+          }
+        }
+      }
+    },
+    "$edgeHub": {
+      "properties.desired": {
+        "schemaVersion": "1.1",
+        "routes": {
+          "solarToController": "FROM /messages/modules/solar-module/outputs/telemetry INTO BrokeredEndpoint(\"/modules/controller-module/inputs/telemetry\")",
+          "batteryToController": "FROM /messages/modules/battery-module/outputs/telemetry INTO BrokeredEndpoint(\"/modules/controller-module/inputs/telemetry\")",
+          "boilerToController": "FROM /messages/modules/boiler-module/outputs/telemetry INTO BrokeredEndpoint(\"/modules/controller-module/inputs/telemetry\")",
+          "controllerToCloud": "FROM /messages/modules/controller-module/outputs/cloud INTO $upstream",
+          "controllerToTelemetry": "FROM /messages/modules/controller-module/outputs/cloud INTO BrokeredEndpoint(\"/modules/telemetry-module/inputs/aggregated\")"
+        },
+        "storeAndForwardConfiguration": {
+          "timeToLiveSecs": 7200
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "telemetry-module"
+version = "0.1.0"
+description = "IoT Edge telemetry module — Azure Monitor exporter"
+authors = []
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+azure-iot-device = "2.14.0"
+structlog = ">=24.0"
+asyncio-mqtt = ">=0.16"
+azure-monitor-opentelemetry-exporter = ">=1.0.0b21"
+opentelemetry-sdk = ">=1.20.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+pytest-asyncio = ">=0.23"
+pytest-cov = ">=5.0"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

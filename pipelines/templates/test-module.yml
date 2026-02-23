@@ -1,0 +1,49 @@
+parameters:
+  - name: moduleName
+    type: string
+
+steps:
+  - task: UsePythonVersion@0
+    displayName: 'Use Python 3.12'
+    inputs:
+      versionSpec: '3.12'
+      addToPath: true
+
+  - script: pip install --quiet poetry==1.8.3
+    displayName: 'Install Poetry'
+
+  - script: |
+      # Install shared base package (not managed by Poetry)
+      pip install --quiet /shared
+
+      # Install module + dev dependencies via Poetry
+      cd modules/${{ parameters.moduleName }}
+      poetry install --no-root
+    displayName: 'Install dependencies — ${{ parameters.moduleName }}'
+    workingDirectory: $(Build.SourcesDirectory)
+
+  - script: |
+      cd modules/${{ parameters.moduleName }}
+      poetry run pytest tests \
+        --cov=src \
+        --cov-report=xml:../../coverage-${{ parameters.moduleName }}.xml \
+        --junitxml=../../test-results-${{ parameters.moduleName }}.xml \
+        -v
+    displayName: 'Run tests — ${{ parameters.moduleName }}'
+    workingDirectory: $(Build.SourcesDirectory)
+    env:
+      EDGE_MODE: local
+
+  - task: PublishTestResults@2
+    displayName: 'Publish test results — ${{ parameters.moduleName }}'
+    condition: always()
+    inputs:
+      testResultsFormat: JUnit
+      testResultsFiles: 'test-results-${{ parameters.moduleName }}.xml'
+      testRunTitle: '${{ parameters.moduleName }}'
+
+  - task: PublishCodeCoverageResults@2
+    displayName: 'Publish coverage — ${{ parameters.moduleName }}'
+    condition: always()
+    inputs:
+      summaryFileLocation: 'coverage-${{ parameters.moduleName }}.xml'

@@ -1,0 +1,31 @@
+parameters:
+  - name: moduleName
+    type: string
+  - name: registryAddress
+    type: string
+  - name: imageTag
+    type: string
+    default: $(Build.BuildId)
+
+steps:
+  - task: Docker@2
+    displayName: 'Build image — ${{ parameters.moduleName }}'
+    inputs:
+      command: build
+      containerRegistry: $(DOCKER_SERVICE_CONNECTION)
+      repository: ${{ parameters.moduleName }}
+      dockerfile: modules/${{ parameters.moduleName }}/Dockerfile
+      buildContext: $(Build.SourcesDirectory)
+      tags: |
+        ${{ parameters.imageTag }}
+        latest
+
+  - task: Docker@2
+    displayName: 'Push image — ${{ parameters.moduleName }}'
+    inputs:
+      command: push
+      containerRegistry: $(DOCKER_SERVICE_CONNECTION)
+      repository: ${{ parameters.moduleName }}
+      tags: |
+        ${{ parameters.imageTag }}
+        latest

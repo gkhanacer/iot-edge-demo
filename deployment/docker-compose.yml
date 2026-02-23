@@ -1,0 +1,90 @@
+version: "3.9"
+
+# Local development environment.
+# Simulates the IoT Edge module network using a Mosquitto MQTT broker.
+# Set EDGE_MODE=local in each module to use the MQTT client instead of the Azure SDK.
+
+services:
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  solar-module:
+    build:
+      context: ..                                   # repo root — shared/ is accessible
+      dockerfile: modules/solar-module/Dockerfile
+    environment:
+      EDGE_MODE: local
+      MQTT_BROKER_HOST: mosquitto
+      IOTEDGE_MODULEID: solar-module
+      ASSET_ID: solar-01
+      MAX_POWER_KW: "100.0"
+      TELEMETRY_INTERVAL_S: "5"
+    depends_on:
+      - mosquitto
+
+  battery-module:
+    build:
+      context: ..
+      dockerfile: modules/battery-module/Dockerfile
+    environment:
+      EDGE_MODE: local
+      MQTT_BROKER_HOST: mosquitto
+      IOTEDGE_MODULEID: battery-module
+      ASSET_ID: battery-01
+      CAPACITY_KWH: "500.0"
+      MAX_POWER_KW: "100.0"
+      TELEMETRY_INTERVAL_S: "5"
+    depends_on:
+      - mosquitto
+
+  boiler-module:
+    build:
+      context: ..
+      dockerfile: modules/boiler-module/Dockerfile
+    environment:
+      EDGE_MODE: local
+      MQTT_BROKER_HOST: mosquitto
+      IOTEDGE_MODULEID: boiler-module
+      ASSET_ID: boiler-01
+      MAX_POWER_KW: "200.0"
+      DEFAULT_TARGET_C: "80.0"
+      TELEMETRY_INTERVAL_S: "5"
+    depends_on:
+      - mosquitto
+
+  controller-module:
+    build:
+      context: ..
+      dockerfile: modules/controller-module/Dockerfile
+    environment:
+      EDGE_MODE: local
+      MQTT_BROKER_HOST: mosquitto
+      IOTEDGE_MODULEID: controller-module
+      IOTEDGE_DEVICEID: edge-device-local
+      REPORTING_INTERVAL_S: "15"
+      SURPLUS_THRESHOLD_KW: "10.0"
+      LOCAL_INPUT_TOPICS: "edge/+/outputs/telemetry"
+    depends_on:
+      - mosquitto
+      - solar-module
+      - battery-module
+      - boiler-module
+
+  telemetry-module:
+    build:
+      context: ..
+      dockerfile: modules/telemetry-module/Dockerfile
+    environment:
+      EDGE_MODE: local
+      MQTT_BROKER_HOST: mosquitto
+      IOTEDGE_MODULEID: telemetry-module
+      AZURE_MONITOR_CONNECTION_STRING: ${AZURE_MONITOR_CONNECTION_STRING:-}
+      EXPORT_INTERVAL_MS: "30000"
+      LOCAL_INPUT_TOPICS: "edge/+/outputs/cloud"
+    depends_on:
+      - controller-module

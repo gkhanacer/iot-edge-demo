@@ -1,0 +1,166 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - modules/**
+      - shared/**
+      - infra/**
+      - deployment/**
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  MODULES: solar-module battery-module boiler-module controller-module telemetry-module
+  PYTHON_VERSION: '3.11'
+
+stages:
+
+  # ── Stage 1: Test all modules in parallel ──────────────────────────────────
+  - stage: Test
+    displayName: 'Test'
+    jobs:
+      - job: TestModules
+        displayName: 'Test'
+        strategy:
+          parallel: 5
+          matrix:
+            solar:
+              MODULE: solar-module
+            battery:
+              MODULE: battery-module
+            boiler:
+              MODULE: boiler-module
+            controller:
+              MODULE: controller-module
+            telemetry:
+              MODULE: telemetry-module
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - template: pipelines/templates/test-module.yml
+            parameters:
+              moduleName: $(MODULE)
+
+      - job: LintAndTypeCheck
+        displayName: 'Lint & Type Check'
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(PYTHON_VERSION)'
+
+          - script: pip install ruff mypy
+            displayName: 'Install linting tools'
+
+          - script: ruff check modules/ shared/
+            displayName: 'Ruff lint'
+
+          - script: |
+              for module in $(MODULES); do
+                mypy modules/$module/src --ignore-missing-imports || true
+              done
+            displayName: 'Mypy type check'
+
+  # ── Stage 2: Build and push Docker images ──────────────────────────────────
+  - stage: Build
+    displayName: 'Build & Push'
+    dependsOn: Test
+    condition: succeeded()
+    jobs:
+      - job: BuildImages
+        displayName: 'Build'
+        strategy:
+          parallel: 5
+          matrix:
+            solar:
+              MODULE: solar-module
+            battery:
+              MODULE: battery-module
+            boiler:
+              MODULE: boiler-module
+            controller:
+              MODULE: controller-module
+            telemetry:
+              MODULE: telemetry-module
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - template: pipelines/templates/build-module.yml
+            parameters:
+              moduleName: $(MODULE)
+              registryAddress: $(ACR_LOGIN_SERVER)
+              imageTag: $(Build.BuildId)
+
+  # ── Stage 3: Deploy infrastructure (main branch only) ─────────────────────
+  - stage: Infrastructure
+    displayName: 'Deploy Infrastructure'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployBicep
+        displayName: 'Bicep deployment'
+        environment: iot-edge-staging
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep infra'
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az group create \
+                        --name $(RESOURCE_GROUP) \
+                        --location westeurope \
+                        --tags env=$(ENVIRONMENT) project=energy-edge
+
+                      az deployment group create \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --template-file infra/main.bicep \
+                        --parameters infra/main.bicepparam \
+                        --parameters env=$(ENVIRONMENT) \
+                        --parameters alertEmailAddress=$(ALERT_EMAIL) \
+                        --name "deploy-$(Build.BuildId)"
+
+  # ── Stage 4: Deploy to IoT Edge (main branch only) ─────────────────────────
+  - stage: Deploy
+    displayName: 'Deploy to Edge'
+    dependsOn: Infrastructure
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployToEdge
+        displayName: 'IoT Edge deployment'
+        environment: iot-edge-staging
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    # Replace placeholders in deployment manifest
+                    sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
+                    sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
+                  displayName: 'Substitute deployment variables'
+
+                - task: AzureIoTEdge@2
+                  displayName: 'Deploy modules to IoT Edge'
+                  inputs:
+                    action: 'Deploy Modules'
+                    deploymentFilePath: deployment/deployment.template.json
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    iothubname: $(IOT_HUB_NAME)
+                    deviceId: $(EDGE_DEVICE_ID)
+                    deploymentid: 'deploy-$(Build.BuildId)'

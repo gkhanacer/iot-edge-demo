@@ -1,0 +1,4 @@
+azure-iot-device==2.14.0
+structlog>=24.0
+asyncio-mqtt>=0.16
+prometheus-client>=0.20
