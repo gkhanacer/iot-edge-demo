@@ -29,7 +29,6 @@ stages:
       - job: TestModules
         displayName: 'Test'
         strategy:
-          parallel: 5
           matrix:
             solar:
               MODULE: solar-module
@@ -78,7 +77,6 @@ stages:
       - job: BuildImages
         displayName: 'Build'
         strategy:
-          parallel: 5
           matrix:
             solar:
               MODULE: solar-module
