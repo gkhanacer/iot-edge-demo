@@ -18,7 +18,7 @@ pr:
 
 variables:
   MODULES: solar-module battery-module boiler-module controller-module telemetry-module
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12'
 
 stages:
 
