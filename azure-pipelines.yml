@@ -68,11 +68,48 @@ stages:
               done
             displayName: 'Mypy type check'
 
-  # ── Stage 2: Build and push Docker images ──────────────────────────────────
+  # ── Stage 2: Deploy infrastructure (main branch only) ─────────────────────
+  - stage: Infrastructure
+    displayName: 'Deploy Infrastructure'
+    dependsOn: Test
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployBicep
+        displayName: 'Bicep deployment'
+        environment: iot-edge-staging
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep infra'
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az group create \
+                        --name $(RESOURCE_GROUP) \
+                        --location westeurope \
+                        --tags env=$(ENVIRONMENT) project=energy-edge
+
+                      az deployment group create \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --template-file infra/main.bicep \
+                        --parameters infra/main.bicepparam \
+                        --parameters env=$(ENVIRONMENT) \
+                        --parameters alertEmailAddress=$(ALERT_EMAIL) \
+                        --name "deploy-$(Build.BuildId)"
+
+  # ── Stage 3: Build and push Docker images (main branch only) ───────────────
   - stage: Build
     displayName: 'Build & Push'
-    dependsOn: Test
-    condition: succeeded()
+    dependsOn: Infrastructure
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     jobs:
       - job: BuildImages
         displayName: 'Build'
@@ -97,45 +134,10 @@ stages:
               registryAddress: $(ACR_LOGIN_SERVER)
               imageTag: $(Build.BuildId)
 
-  # ── Stage 3: Deploy infrastructure (main branch only) ─────────────────────
-  - stage: Infrastructure
-    displayName: 'Deploy Infrastructure'
-    dependsOn: Build
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-    jobs:
-      - deployment: DeployBicep
-        displayName: 'Bicep deployment'
-        environment: iot-edge-staging
-        pool:
-          vmImage: ubuntu-latest
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - task: AzureCLI@2
-                  displayName: 'Deploy Bicep infra'
-                  inputs:
-                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
-                    scriptType: bash
-                    scriptLocation: inlineScript
-                    inlineScript: |
-                      az group create \
-                        --name $(RESOURCE_GROUP) \
-                        --location westeurope \
-                        --tags env=$(ENVIRONMENT) project=energy-edge
-
-                      az deployment group create \
-                        --resource-group $(RESOURCE_GROUP) \
-                        --template-file infra/main.bicep \
-                        --parameters infra/main.bicepparam \
-                        --parameters env=$(ENVIRONMENT) \
-                        --parameters alertEmailAddress=$(ALERT_EMAIL) \
-                        --name "deploy-$(Build.BuildId)"
-
   # ── Stage 4: Deploy to IoT Edge (main branch only) ─────────────────────────
   - stage: Deploy
     displayName: 'Deploy to Edge'
-    dependsOn: Infrastructure
+    dependsOn: Build
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     jobs:
       - deployment: DeployToEdge
@@ -147,8 +149,9 @@ stages:
           runOnce:
             deploy:
               steps:
+                - checkout: self
+
                 - script: |
-                    # Replace placeholders in deployment manifest
                     sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
                     sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
                   displayName: 'Substitute deployment variables'
