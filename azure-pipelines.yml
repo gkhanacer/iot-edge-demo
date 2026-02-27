@@ -1,3 +1,21 @@
+parameters:
+  - name: deployDev
+    displayName: 'Deploy to Dev'
+    type: boolean
+    default: true
+  - name: deployTest
+    displayName: 'Deploy to Test'
+    type: boolean
+    default: false
+  - name: deployProd
+    displayName: 'Deploy to Prod'
+    type: boolean
+    default: false
+  - name: provisionInfra
+    displayName: 'Provision Infrastructure'
+    type: boolean
+    default: false
+
 trigger:
   branches:
     include:
@@ -17,12 +35,12 @@ pr:
       - develop
 
 variables:
-  MODULES: solar-module battery-module boiler-module controller-module telemetry-module
   PYTHON_VERSION: '3.12'
+  MODULES: solar-module battery-module boiler-module controller-module telemetry-module
 
 stages:
 
-  # ── Stage 1: Test all modules in parallel ──────────────────────────────────
+  # ── Stage 1: Test (always) ─────────────────────────────────────────────────
   - stage: Test
     displayName: 'Test'
     jobs:
@@ -55,61 +73,23 @@ stages:
           - task: UsePythonVersion@0
             inputs:
               versionSpec: '$(PYTHON_VERSION)'
-
           - script: pip install ruff mypy
             displayName: 'Install linting tools'
-
           - script: ruff check modules/ shared/
             displayName: 'Ruff lint'
-
           - script: |
               for module in $(MODULES); do
                 mypy modules/$module/src --ignore-missing-imports || true
               done
             displayName: 'Mypy type check'
 
-  # ── Stage 2: Deploy infrastructure (main branch only) ─────────────────────
-  - stage: Infrastructure
-    displayName: 'Deploy Infrastructure'
-    dependsOn: Test
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-    jobs:
-      - deployment: DeployBicep
-        displayName: 'Bicep deployment'
-        environment: iot-edge-staging
-        pool:
-          vmImage: ubuntu-latest
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - checkout: self
-
-                - task: AzureCLI@2
-                  displayName: 'Deploy Bicep infra'
-                  inputs:
-                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
-                    scriptType: bash
-                    scriptLocation: inlineScript
-                    inlineScript: |
-                      az group create \
-                        --name $(RESOURCE_GROUP) \
-                        --location westeurope \
-                        --tags env=$(ENVIRONMENT) project=energy-edge
-
-                      az deployment group create \
-                        --resource-group $(RESOURCE_GROUP) \
-                        --template-file infra/main.bicep \
-                        --parameters infra/main.bicepparam \
-                        --parameters env=$(ENVIRONMENT) \
-                        --parameters alertEmailAddress=$(ALERT_EMAIL) \
-                        --name "deploy-$(Build.BuildId)"
-
-  # ── Stage 3: Build and push Docker images (main branch only) ───────────────
+  # ── Stage 2: Build & Push (once — shared ACR) ──────────────────────────────
+  # Runs when at least one environment is selected for deployment.
+  # The same images (tagged with Build.BuildId) are reused across all envs.
   - stage: Build
     displayName: 'Build & Push'
-    dependsOn: Infrastructure
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    dependsOn: Test
+    condition: and(succeeded('Test'), or(eq('${{ parameters.deployDev }}', 'true'), eq('${{ parameters.deployTest }}', 'true'), eq('${{ parameters.deployProd }}', 'true')))
     jobs:
       - job: BuildImages
         displayName: 'Build'
@@ -134,15 +114,18 @@ stages:
               registryAddress: $(ACR_LOGIN_SERVER)
               imageTag: $(Build.BuildId)
 
-  # ── Stage 4: Deploy to IoT Edge (main branch only) ─────────────────────────
-  - stage: Deploy
-    displayName: 'Deploy to Edge'
+  # ══════════════════════════════════════════════════════════════════════════
+  # DEV
+  # ══════════════════════════════════════════════════════════════════════════
+
+  - stage: Infra_Dev
+    displayName: '[Dev] Provision Infrastructure'
     dependsOn: Build
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    condition: and(succeeded('Build'), eq('${{ parameters.deployDev }}', 'true'), eq('${{ parameters.provisionInfra }}', 'true'))
     jobs:
-      - deployment: DeployToEdge
-        displayName: 'IoT Edge deployment'
-        environment: iot-edge-staging
+      - deployment: DeployBicep
+        displayName: 'Bicep — dev'
+        environment: iot-edge-dev
         pool:
           vmImage: ubuntu-latest
         strategy:
@@ -150,18 +133,202 @@ stages:
             deploy:
               steps:
                 - checkout: self
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep — dev'
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az group create \
+                        --name $(RESOURCE_GROUP_DEV) \
+                        --location westeurope \
+                        --tags env=dev project=energy-edge
 
+                      az deployment group create \
+                        --resource-group $(RESOURCE_GROUP_DEV) \
+                        --template-file infra/main.bicep \
+                        --parameters infra/main.bicepparam \
+                        --parameters env=dev \
+                        --parameters alertEmailAddress=$(ALERT_EMAIL) \
+                        --name "deploy-dev-$(Build.BuildId)"
+
+  - stage: Deploy_Dev
+    displayName: '[Dev] Deploy to Edge'
+    dependsOn:
+      - Build
+      - Infra_Dev
+    condition: and(eq('${{ parameters.deployDev }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Infra_Dev.result, 'Succeeded', 'Skipped'))
+    jobs:
+      - deployment: DeployToEdge
+        displayName: 'IoT Edge — dev'
+        environment: iot-edge-dev
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
                 - script: |
                     sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
                     sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
                   displayName: 'Substitute deployment variables'
-
                 - task: AzureIoTEdge@2
                   displayName: 'Deploy modules to IoT Edge'
                   inputs:
                     action: 'Deploy Modules'
                     deploymentFilePath: deployment/deployment.template.json
                     azureSubscription: $(AZURE_SERVICE_CONNECTION)
-                    iothubname: $(IOT_HUB_NAME)
-                    deviceId: $(EDGE_DEVICE_ID)
-                    deploymentid: 'deploy-$(Build.BuildId)'
+                    iothubname: $(IOT_HUB_NAME_DEV)
+                    deviceId: $(EDGE_DEVICE_ID_DEV)
+                    deploymentid: 'deploy-dev-$(Build.BuildId)'
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # TEST  (waits for Dev if Dev is also selected → dev → test promotion)
+  # ══════════════════════════════════════════════════════════════════════════
+
+  - stage: Infra_Test
+    displayName: '[Test] Provision Infrastructure'
+    dependsOn:
+      - Build
+      - Deploy_Dev
+    condition: and(eq('${{ parameters.deployTest }}', 'true'), eq('${{ parameters.provisionInfra }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'))
+    jobs:
+      - deployment: DeployBicep
+        displayName: 'Bicep — test'
+        environment: iot-edge-test
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep — test'
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az group create \
+                        --name $(RESOURCE_GROUP_TEST) \
+                        --location westeurope \
+                        --tags env=test project=energy-edge
+
+                      az deployment group create \
+                        --resource-group $(RESOURCE_GROUP_TEST) \
+                        --template-file infra/main.bicep \
+                        --parameters infra/main.bicepparam \
+                        --parameters env=test \
+                        --parameters alertEmailAddress=$(ALERT_EMAIL) \
+                        --name "deploy-test-$(Build.BuildId)"
+
+  - stage: Deploy_Test
+    displayName: '[Test] Deploy to Edge'
+    dependsOn:
+      - Build
+      - Deploy_Dev
+      - Infra_Test
+    condition: and(eq('${{ parameters.deployTest }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Infra_Test.result, 'Succeeded', 'Skipped'))
+    jobs:
+      - deployment: DeployToEdge
+        displayName: 'IoT Edge — test'
+        environment: iot-edge-test
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: |
+                    sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
+                    sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
+                  displayName: 'Substitute deployment variables'
+                - task: AzureIoTEdge@2
+                  displayName: 'Deploy modules to IoT Edge'
+                  inputs:
+                    action: 'Deploy Modules'
+                    deploymentFilePath: deployment/deployment.template.json
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    iothubname: $(IOT_HUB_NAME_TEST)
+                    deviceId: $(EDGE_DEVICE_ID_TEST)
+                    deploymentid: 'deploy-test-$(Build.BuildId)'
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PROD  (waits for Test if Test is selected → test → prod promotion)
+  #        iot-edge-prod environment = manual approval gate in Azure DevOps
+  # ══════════════════════════════════════════════════════════════════════════
+
+  - stage: Infra_Prod
+    displayName: '[Prod] Provision Infrastructure'
+    dependsOn:
+      - Build
+      - Deploy_Dev
+      - Deploy_Test
+    condition: and(eq('${{ parameters.deployProd }}', 'true'), eq('${{ parameters.provisionInfra }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Deploy_Test.result, 'Succeeded', 'Skipped'))
+    jobs:
+      - deployment: DeployBicep
+        displayName: 'Bicep — prod'
+        environment: iot-edge-prod
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AzureCLI@2
+                  displayName: 'Deploy Bicep — prod'
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az group create \
+                        --name $(RESOURCE_GROUP_PROD) \
+                        --location westeurope \
+                        --tags env=prod project=energy-edge
+
+                      az deployment group create \
+                        --resource-group $(RESOURCE_GROUP_PROD) \
+                        --template-file infra/main.bicep \
+                        --parameters infra/main.bicepparam \
+                        --parameters env=prod \
+                        --parameters alertEmailAddress=$(ALERT_EMAIL) \
+                        --name "deploy-prod-$(Build.BuildId)"
+
+  - stage: Deploy_Prod
+    displayName: '[Prod] Deploy to Edge'
+    dependsOn:
+      - Build
+      - Deploy_Dev
+      - Deploy_Test
+      - Infra_Prod
+    condition: and(eq('${{ parameters.deployProd }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Deploy_Test.result, 'Succeeded', 'Skipped'), in(dependencies.Infra_Prod.result, 'Succeeded', 'Skipped'))
+    jobs:
+      - deployment: DeployToEdge
+        displayName: 'IoT Edge — prod'
+        environment: iot-edge-prod
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: |
+                    sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
+                    sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
+                  displayName: 'Substitute deployment variables'
+                - task: AzureIoTEdge@2
+                  displayName: 'Deploy modules to IoT Edge'
+                  inputs:
+                    action: 'Deploy Modules'
+                    deploymentFilePath: deployment/deployment.template.json
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    iothubname: $(IOT_HUB_NAME_PROD)
+                    deviceId: $(EDGE_DEVICE_ID_PROD)
+                    deploymentid: 'deploy-prod-$(Build.BuildId)'
