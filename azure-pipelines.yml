@@ -85,14 +85,37 @@ stages:
 
   # ── Stage 2: Build & Push (once — shared ACR) ──────────────────────────────
   # Runs when at least one environment is selected for deployment.
-  # The same images (tagged with Build.BuildId) are reused across all envs.
+  # Tag strategy:
+  #   main branch  → <VERSION>          e.g. 3.14        (+ latest)
+  #   other branch → <VERSION>-<sha8>   e.g. 3.14-abc12345
   - stage: Build
     displayName: 'Build & Push'
     dependsOn: Test
     condition: and(succeeded('Test'), or(eq('${{ parameters.deployDev }}', 'true'), eq('${{ parameters.deployTest }}', 'true'), eq('${{ parameters.deployProd }}', 'true')))
     jobs:
+      - job: ComputeTag
+        displayName: 'Compute image tag'
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: |
+              VERSION=$(cat VERSION)
+              if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
+                TAG="$VERSION"
+              else
+                SHORT_SHA=$(echo "$(Build.SourceVersion)" | cut -c1-8)
+                TAG="${VERSION}-${SHORT_SHA}"
+              fi
+              echo "Image tag: $TAG"
+              echo "##vso[task.setvariable variable=imageTag;isOutput=true]$TAG"
+            name: setTag
+            displayName: 'Set image tag from VERSION + branch'
+
       - job: BuildImages
         displayName: 'Build'
+        dependsOn: ComputeTag
+        variables:
+          imageTag: $[ dependencies.ComputeTag.outputs['setTag.imageTag'] ]
         strategy:
           matrix:
             solar:
@@ -112,7 +135,7 @@ stages:
             parameters:
               moduleName: $(MODULE)
               registryAddress: $(ACR_LOGIN_SERVER)
-              imageTag: $(Build.BuildId)
+              imageTag: $(imageTag)
 
   # ══════════════════════════════════════════════════════════════════════════
   # DEV

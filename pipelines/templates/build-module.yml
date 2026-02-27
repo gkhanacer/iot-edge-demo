@@ -5,7 +5,6 @@ parameters:
     type: string
   - name: imageTag
     type: string
-    default: $(Build.BuildId)
 
 steps:
   - task: AzureCLI@2
@@ -15,9 +14,17 @@ steps:
       scriptType: bash
       scriptLocation: inlineScript
       inlineScript: |
+        ACR_NAME=$(echo "${{ parameters.registryAddress }}" | cut -d. -f1)
+
+        # On main branch also push :latest; on feature branches versioned tag only
+        LATEST_TAG=""
+        if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
+          LATEST_TAG="--image ${{ parameters.moduleName }}:latest"
+        fi
+
         az acr build \
-          --registry $(echo "${{ parameters.registryAddress }}" | cut -d. -f1) \
+          --registry "$ACR_NAME" \
           --image "${{ parameters.moduleName }}:${{ parameters.imageTag }}" \
-          --image "${{ parameters.moduleName }}:latest" \
+          $LATEST_TAG \
           --file modules/${{ parameters.moduleName }}/Dockerfile \
           .
