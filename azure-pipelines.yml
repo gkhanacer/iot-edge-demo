@@ -1,5 +1,5 @@
 parameters:
-  # Infrastructure provisioning (independent per env)
+  # ── Infrastructure provisioning (independent, optional) ────────────────────
   - name: deployInfraDev
     displayName: 'Provision Infra — Dev'
     type: boolean
@@ -12,19 +12,55 @@ parameters:
     displayName: 'Provision Infra — Prod'
     type: boolean
     default: false
-  # Edge deployments (follow promotion chain: dev → test → prod)
+
+  # ── Edge deployments ────────────────────────────────────────────────────────
   - name: deployDevEdge
     displayName: 'Deploy Edge — Dev'
     type: boolean
     default: true
+  - name: devDeployTarget
+    displayName: 'Dev — Device target'
+    type: string
+    default: single
+    values:
+      - single   # deploy to devDeviceId only
+      - all      # deploy to all devices with tags.env='dev'
+  - name: devDeviceId
+    displayName: 'Dev — Device ID (used when target=single)'
+    type: string
+    default: $(EDGE_DEVICE_ID_DEV)
+
   - name: deployTestEdge
     displayName: 'Deploy Edge — Test'
     type: boolean
     default: false
+  - name: testDeployTarget
+    displayName: 'Test — Device target'
+    type: string
+    default: single
+    values:
+      - single
+      - all
+  - name: testDeviceId
+    displayName: 'Test — Device ID (used when target=single)'
+    type: string
+    default: $(EDGE_DEVICE_ID_TEST)
+
   - name: deployProdEdge
     displayName: 'Deploy Edge — Prod'
     type: boolean
     default: false
+  - name: prodDeployTarget
+    displayName: 'Prod — Device target'
+    type: string
+    default: single
+    values:
+      - single
+      - all
+  - name: prodDeviceId
+    displayName: 'Prod — Device ID (used when target=single)'
+    type: string
+    default: $(EDGE_DEVICE_ID_PROD)
 
 trigger:
   branches:
@@ -147,7 +183,7 @@ stages:
               imageTag: $(imageTag)
 
   # ══════════════════════════════════════════════════════════════════════════
-  # DEV
+  # INFRA — independent stages, depend only on Test
   # ══════════════════════════════════════════════════════════════════════════
 
   - stage: Infra_Dev
@@ -185,47 +221,10 @@ stages:
                         --parameters alertEmailAddress=$(ALERT_EMAIL) \
                         --name "deploy-dev-$(Build.BuildId)"
 
-  - stage: Deploy_Dev
-    displayName: '[Dev] Deploy to Edge'
-    dependsOn:
-      - Build
-      - Infra_Dev
-    condition: and(eq('${{ parameters.deployDevEdge }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Infra_Dev.result, 'Succeeded', 'Skipped'))
-    jobs:
-      - deployment: DeployToEdge
-        displayName: 'IoT Edge — dev'
-        environment: iot-edge-dev
-        pool:
-          vmImage: ubuntu-latest
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - checkout: self
-                - script: |
-                    sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
-                    sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
-                  displayName: 'Substitute deployment variables'
-                - task: AzureIoTEdge@2
-                  displayName: 'Deploy modules to IoT Edge'
-                  inputs:
-                    action: 'Deploy Modules'
-                    deploymentFilePath: deployment/deployment.template.json
-                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
-                    iothubname: $(IOT_HUB_NAME_DEV)
-                    deviceId: $(EDGE_DEVICE_ID_DEV)
-                    deploymentid: 'deploy-dev-$(Build.BuildId)'
-
-  # ══════════════════════════════════════════════════════════════════════════
-  # TEST  (waits for Dev edge deploy if selected → promotion chain)
-  # ══════════════════════════════════════════════════════════════════════════
-
   - stage: Infra_Test
     displayName: '[Test] Provision Infrastructure'
-    dependsOn:
-      - Test
-      - Deploy_Dev
-    condition: and(eq('${{ parameters.deployInfraTest }}', 'true'), in(dependencies.Test.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'))
+    dependsOn: Test
+    condition: and(succeeded('Test'), eq('${{ parameters.deployInfraTest }}', 'true'))
     jobs:
       - deployment: DeployBicep
         displayName: 'Bicep — test'
@@ -257,50 +256,10 @@ stages:
                         --parameters alertEmailAddress=$(ALERT_EMAIL) \
                         --name "deploy-test-$(Build.BuildId)"
 
-  - stage: Deploy_Test
-    displayName: '[Test] Deploy to Edge'
-    dependsOn:
-      - Build
-      - Deploy_Dev
-      - Infra_Test
-    condition: and(eq('${{ parameters.deployTestEdge }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Infra_Test.result, 'Succeeded', 'Skipped'))
-    jobs:
-      - deployment: DeployToEdge
-        displayName: 'IoT Edge — test'
-        environment: iot-edge-test
-        pool:
-          vmImage: ubuntu-latest
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - checkout: self
-                - script: |
-                    sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
-                    sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
-                  displayName: 'Substitute deployment variables'
-                - task: AzureIoTEdge@2
-                  displayName: 'Deploy modules to IoT Edge'
-                  inputs:
-                    action: 'Deploy Modules'
-                    deploymentFilePath: deployment/deployment.template.json
-                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
-                    iothubname: $(IOT_HUB_NAME_TEST)
-                    deviceId: $(EDGE_DEVICE_ID_TEST)
-                    deploymentid: 'deploy-test-$(Build.BuildId)'
-
-  # ══════════════════════════════════════════════════════════════════════════
-  # PROD  (waits for Test edge deploy if selected → promotion chain)
-  #        iot-edge-prod environment = manual approval gate
-  # ══════════════════════════════════════════════════════════════════════════
-
   - stage: Infra_Prod
     displayName: '[Prod] Provision Infrastructure'
-    dependsOn:
-      - Test
-      - Deploy_Dev
-      - Deploy_Test
-    condition: and(eq('${{ parameters.deployInfraProd }}', 'true'), in(dependencies.Test.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Deploy_Test.result, 'Succeeded', 'Skipped'))
+    dependsOn: Test
+    condition: and(succeeded('Test'), eq('${{ parameters.deployInfraProd }}', 'true'))
     jobs:
       - deployment: DeployBicep
         displayName: 'Bicep — prod'
@@ -332,17 +291,111 @@ stages:
                         --parameters alertEmailAddress=$(ALERT_EMAIL) \
                         --name "deploy-prod-$(Build.BuildId)"
 
+  # ══════════════════════════════════════════════════════════════════════════
+  # EDGE DEPLOYMENTS — promotion chain: dev → test → prod
+  # Deploy stages depend only on Build + previous env deploy (NOT on Infra)
+  # ══════════════════════════════════════════════════════════════════════════
+
+  - stage: Deploy_Dev
+    displayName: '[Dev] Deploy to Edge'
+    dependsOn: Build
+    condition: and(eq('${{ parameters.deployDevEdge }}', 'true'), succeeded('Build'))
+    jobs:
+      - deployment: DeployToEdge
+        displayName: 'IoT Edge — dev (${{ parameters.devDeployTarget }})'
+        environment: iot-edge-dev
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: |
+                    sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
+                    sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
+                  displayName: 'Substitute deployment variables'
+                - task: AzureCLI@2
+                  displayName: 'Deploy to IoT Edge — dev'
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az extension add --name azure-iot --yes 2>/dev/null || true
+
+                      if [ "${{ parameters.devDeployTarget }}" = "all" ]; then
+                        echo "Deploying to ALL dev devices (tags.env='dev')"
+                        az iot edge deployment create \
+                          --hub-name $(IOT_HUB_NAME_DEV) \
+                          --content deployment/deployment.template.json \
+                          --deployment-id "deploy-dev-$(Build.BuildId)" \
+                          --target-condition "tags.env='dev'" \
+                          --priority 10
+                      else
+                        echo "Deploying to device: ${{ parameters.devDeviceId }}"
+                        az iot edge set-modules \
+                          --hub-name $(IOT_HUB_NAME_DEV) \
+                          --device-id "${{ parameters.devDeviceId }}" \
+                          --content deployment/deployment.template.json
+                      fi
+
+  - stage: Deploy_Test
+    displayName: '[Test] Deploy to Edge'
+    dependsOn:
+      - Build
+      - Deploy_Dev
+    condition: and(eq('${{ parameters.deployTestEdge }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'))
+    jobs:
+      - deployment: DeployToEdge
+        displayName: 'IoT Edge — test (${{ parameters.testDeployTarget }})'
+        environment: iot-edge-test
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: |
+                    sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
+                    sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
+                  displayName: 'Substitute deployment variables'
+                - task: AzureCLI@2
+                  displayName: 'Deploy to IoT Edge — test'
+                  inputs:
+                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az extension add --name azure-iot --yes 2>/dev/null || true
+
+                      if [ "${{ parameters.testDeployTarget }}" = "all" ]; then
+                        echo "Deploying to ALL test devices (tags.env='test')"
+                        az iot edge deployment create \
+                          --hub-name $(IOT_HUB_NAME_TEST) \
+                          --content deployment/deployment.template.json \
+                          --deployment-id "deploy-test-$(Build.BuildId)" \
+                          --target-condition "tags.env='test'" \
+                          --priority 10
+                      else
+                        echo "Deploying to device: ${{ parameters.testDeviceId }}"
+                        az iot edge set-modules \
+                          --hub-name $(IOT_HUB_NAME_TEST) \
+                          --device-id "${{ parameters.testDeviceId }}" \
+                          --content deployment/deployment.template.json
+                      fi
+
   - stage: Deploy_Prod
     displayName: '[Prod] Deploy to Edge'
     dependsOn:
       - Build
       - Deploy_Dev
       - Deploy_Test
-      - Infra_Prod
-    condition: and(eq('${{ parameters.deployProdEdge }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Deploy_Test.result, 'Succeeded', 'Skipped'), in(dependencies.Infra_Prod.result, 'Succeeded', 'Skipped'))
+    condition: and(eq('${{ parameters.deployProdEdge }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Deploy_Test.result, 'Succeeded', 'Skipped'))
     jobs:
       - deployment: DeployToEdge
-        displayName: 'IoT Edge — prod'
+        displayName: 'IoT Edge — prod (${{ parameters.prodDeployTarget }})'
         environment: iot-edge-prod
         pool:
           vmImage: ubuntu-latest
@@ -355,12 +408,27 @@ stages:
                     sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
                     sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
                   displayName: 'Substitute deployment variables'
-                - task: AzureIoTEdge@2
-                  displayName: 'Deploy modules to IoT Edge'
+                - task: AzureCLI@2
+                  displayName: 'Deploy to IoT Edge — prod'
                   inputs:
-                    action: 'Deploy Modules'
-                    deploymentFilePath: deployment/deployment.template.json
                     azureSubscription: $(AZURE_SERVICE_CONNECTION)
-                    iothubname: $(IOT_HUB_NAME_PROD)
-                    deviceId: $(EDGE_DEVICE_ID_PROD)
-                    deploymentid: 'deploy-prod-$(Build.BuildId)'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az extension add --name azure-iot --yes 2>/dev/null || true
+
+                      if [ "${{ parameters.prodDeployTarget }}" = "all" ]; then
+                        echo "Deploying to ALL prod devices (tags.env='prod')"
+                        az iot edge deployment create \
+                          --hub-name $(IOT_HUB_NAME_PROD) \
+                          --content deployment/deployment.template.json \
+                          --deployment-id "deploy-prod-$(Build.BuildId)" \
+                          --target-condition "tags.env='prod'" \
+                          --priority 10
+                      else
+                        echo "Deploying to device: ${{ parameters.prodDeviceId }}"
+                        az iot edge set-modules \
+                          --hub-name $(IOT_HUB_NAME_PROD) \
+                          --device-id "${{ parameters.prodDeviceId }}" \
+                          --content deployment/deployment.template.json
+                      fi
