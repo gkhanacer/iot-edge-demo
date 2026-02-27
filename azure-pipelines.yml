@@ -1,18 +1,28 @@
 parameters:
-  - name: deployDev
-    displayName: 'Deploy to Dev'
+  # Infrastructure provisioning (independent per env)
+  - name: deployInfraDev
+    displayName: 'Provision Infra — Dev'
+    type: boolean
+    default: false
+  - name: deployInfraTest
+    displayName: 'Provision Infra — Test'
+    type: boolean
+    default: false
+  - name: deployInfraProd
+    displayName: 'Provision Infra — Prod'
+    type: boolean
+    default: false
+  # Edge deployments (follow promotion chain: dev → test → prod)
+  - name: deployDevEdge
+    displayName: 'Deploy Edge — Dev'
     type: boolean
     default: true
-  - name: deployTest
-    displayName: 'Deploy to Test'
+  - name: deployTestEdge
+    displayName: 'Deploy Edge — Test'
     type: boolean
     default: false
-  - name: deployProd
-    displayName: 'Deploy to Prod'
-    type: boolean
-    default: false
-  - name: provisionInfra
-    displayName: 'Provision Infrastructure'
+  - name: deployProdEdge
+    displayName: 'Deploy Edge — Prod'
     type: boolean
     default: false
 
@@ -84,14 +94,13 @@ stages:
             displayName: 'Mypy type check'
 
   # ── Stage 2: Build & Push (once — shared ACR) ──────────────────────────────
-  # Runs when at least one environment is selected for deployment.
   # Tag strategy:
   #   main branch  → <VERSION>          e.g. 3.14        (+ latest)
   #   other branch → <VERSION>-<sha8>   e.g. 3.14-abc12345
   - stage: Build
     displayName: 'Build & Push'
     dependsOn: Test
-    condition: and(succeeded('Test'), or(eq('${{ parameters.deployDev }}', 'true'), eq('${{ parameters.deployTest }}', 'true'), eq('${{ parameters.deployProd }}', 'true')))
+    condition: and(succeeded('Test'), or(eq('${{ parameters.deployDevEdge }}', 'true'), eq('${{ parameters.deployTestEdge }}', 'true'), eq('${{ parameters.deployProdEdge }}', 'true')))
     jobs:
       - job: ComputeTag
         displayName: 'Compute image tag'
@@ -143,8 +152,8 @@ stages:
 
   - stage: Infra_Dev
     displayName: '[Dev] Provision Infrastructure'
-    dependsOn: Build
-    condition: and(succeeded('Build'), eq('${{ parameters.deployDev }}', 'true'), eq('${{ parameters.provisionInfra }}', 'true'))
+    dependsOn: Test
+    condition: and(succeeded('Test'), eq('${{ parameters.deployInfraDev }}', 'true'))
     jobs:
       - deployment: DeployBicep
         displayName: 'Bicep — dev'
@@ -181,7 +190,7 @@ stages:
     dependsOn:
       - Build
       - Infra_Dev
-    condition: and(eq('${{ parameters.deployDev }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Infra_Dev.result, 'Succeeded', 'Skipped'))
+    condition: and(eq('${{ parameters.deployDevEdge }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Infra_Dev.result, 'Succeeded', 'Skipped'))
     jobs:
       - deployment: DeployToEdge
         displayName: 'IoT Edge — dev'
@@ -208,15 +217,15 @@ stages:
                     deploymentid: 'deploy-dev-$(Build.BuildId)'
 
   # ══════════════════════════════════════════════════════════════════════════
-  # TEST  (waits for Dev if Dev is also selected → dev → test promotion)
+  # TEST  (waits for Dev edge deploy if selected → promotion chain)
   # ══════════════════════════════════════════════════════════════════════════
 
   - stage: Infra_Test
     displayName: '[Test] Provision Infrastructure'
     dependsOn:
-      - Build
+      - Test
       - Deploy_Dev
-    condition: and(eq('${{ parameters.deployTest }}', 'true'), eq('${{ parameters.provisionInfra }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'))
+    condition: and(eq('${{ parameters.deployInfraTest }}', 'true'), in(dependencies.Test.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'))
     jobs:
       - deployment: DeployBicep
         displayName: 'Bicep — test'
@@ -254,7 +263,7 @@ stages:
       - Build
       - Deploy_Dev
       - Infra_Test
-    condition: and(eq('${{ parameters.deployTest }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Infra_Test.result, 'Succeeded', 'Skipped'))
+    condition: and(eq('${{ parameters.deployTestEdge }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Infra_Test.result, 'Succeeded', 'Skipped'))
     jobs:
       - deployment: DeployToEdge
         displayName: 'IoT Edge — test'
@@ -281,17 +290,17 @@ stages:
                     deploymentid: 'deploy-test-$(Build.BuildId)'
 
   # ══════════════════════════════════════════════════════════════════════════
-  # PROD  (waits for Test if Test is selected → test → prod promotion)
-  #        iot-edge-prod environment = manual approval gate in Azure DevOps
+  # PROD  (waits for Test edge deploy if selected → promotion chain)
+  #        iot-edge-prod environment = manual approval gate
   # ══════════════════════════════════════════════════════════════════════════
 
   - stage: Infra_Prod
     displayName: '[Prod] Provision Infrastructure'
     dependsOn:
-      - Build
+      - Test
       - Deploy_Dev
       - Deploy_Test
-    condition: and(eq('${{ parameters.deployProd }}', 'true'), eq('${{ parameters.provisionInfra }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Deploy_Test.result, 'Succeeded', 'Skipped'))
+    condition: and(eq('${{ parameters.deployInfraProd }}', 'true'), in(dependencies.Test.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Deploy_Test.result, 'Succeeded', 'Skipped'))
     jobs:
       - deployment: DeployBicep
         displayName: 'Bicep — prod'
@@ -330,7 +339,7 @@ stages:
       - Deploy_Dev
       - Deploy_Test
       - Infra_Prod
-    condition: and(eq('${{ parameters.deployProd }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Deploy_Test.result, 'Succeeded', 'Skipped'), in(dependencies.Infra_Prod.result, 'Succeeded', 'Skipped'))
+    condition: and(eq('${{ parameters.deployProdEdge }}', 'true'), in(dependencies.Build.result, 'Succeeded'), in(dependencies.Deploy_Dev.result, 'Succeeded', 'Skipped'), in(dependencies.Deploy_Test.result, 'Succeeded', 'Skipped'), in(dependencies.Infra_Prod.result, 'Succeeded', 'Skipped'))
     jobs:
       - deployment: DeployToEdge
         displayName: 'IoT Edge — prod'
