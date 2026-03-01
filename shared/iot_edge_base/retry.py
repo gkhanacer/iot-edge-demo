@@ -55,8 +55,8 @@ async def with_retry(
             last_exc = exc
             if attempt == max_attempts - 1:
                 break
-            cap = min(max_delay_s, base_delay_s * (2**attempt))
-            delay = random.uniform(0, cap)
+            cap = min(max_delay_s, base_delay_s * (2**attempt))  # exponential window, capped
+            delay = random.uniform(0, cap)                         # full jitter spreads retries across the window
             logger.warning(
                 "Transient failure, retrying",
                 label=label,

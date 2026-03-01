@@ -102,22 +102,22 @@ class Boiler(BaseAsset):
 
         diff = self._target_temp_c - self._current_temp_c
         if diff > 0.5:
-            # Proportional heating — full power when diff > 20°C
+            # Proportional heating — full power when diff > 20°C, ramps down as setpoint approaches
             fraction = min(1.0, diff / 20.0)
             self._power_kw = fraction * self.max_power_kw
             self._current_temp_c += HEATING_RATE_C_PER_KW_S * self._power_kw * elapsed_s
         else:
-            # Maintain setpoint — minimal power
+            # Maintain setpoint — 2% of max power counters thermal loss at steady state
             self._power_kw = 0.02 * self.max_power_kw
             self._current_temp_c = max(
                 AMBIENT_TEMP_C,
                 self._current_temp_c - THERMAL_LOSS_COEFF * (self._current_temp_c - AMBIENT_TEMP_C) * elapsed_s,
             )
 
-        # Pressure follows temperature (ideal gas approximation)
+        # Ideal gas approximation: pressure rises linearly with temperature above ambient
         self._pressure_bar = 1.0 + (self._current_temp_c - AMBIENT_TEMP_C) * 0.05
 
-        # Safety: fault on over-temperature or over-pressure
+        # tick() is sync — ensure_future fires the async fault() coroutine without blocking the simulation step
         if self._current_temp_c > 125.0:
             asyncio.ensure_future(self.fault("OVER_TEMPERATURE"))
         elif self._pressure_bar > 7.0:

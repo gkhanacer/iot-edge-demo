@@ -50,7 +50,7 @@ class Aggregator:
 
     FAULT_SEVERITY_MAP = {
         "FAULT": "critical",
-    }
+    }  # reserved for future multi-level severity escalation logic
 
     def __init__(self, device_id: str, surplus_threshold_kw: float = 10.0) -> None:
         self.device_id = device_id
@@ -59,9 +59,9 @@ class Aggregator:
     async def compute(self, registry: AssetRegistry) -> AggregatedTelemetry:
         snapshots = await registry.get_all()
 
-        generation = sum(s.power_kw for s in snapshots if s.power_kw > 0)
-        consumption = sum(abs(s.power_kw) for s in snapshots if s.power_kw < 0)
-        balance = generation - consumption
+        generation = sum(s.power_kw for s in snapshots if s.power_kw > 0)   # positive power_kw = asset generating (solar / discharging battery)
+        consumption = sum(abs(s.power_kw) for s in snapshots if s.power_kw < 0)  # negative power_kw = asset consuming (boiler / charging battery)
+        balance = generation - consumption  # positive = surplus, negative = deficit
 
         alerts = self._check_alerts(snapshots, balance)
 

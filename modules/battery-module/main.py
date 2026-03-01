@@ -41,12 +41,12 @@ def _build_dispatch(battery: BatteryStorage) -> dict[str, Callable[[dict], Await
 
     async def _start_charging(payload: dict) -> None:
         parsed = StartChargingPayload.model_validate(payload)
-        power_kw = parsed.power_kw if parsed.power_kw is not None else battery.max_power_kw
+        power_kw = parsed.power_kw if parsed.power_kw is not None else battery.max_power_kw  # omit power_kw → full rated power
         await battery.start_charging(power_kw)
 
     async def _start_discharging(payload: dict) -> None:
         parsed = StartDischargingPayload.model_validate(payload)
-        power_kw = parsed.power_kw if parsed.power_kw is not None else battery.max_power_kw
+        power_kw = parsed.power_kw if parsed.power_kw is not None else battery.max_power_kw  # omit power_kw → full rated power
         await battery.start_discharging(power_kw)
 
     return {
@@ -72,10 +72,10 @@ async def register_handlers(client: BaseEdgeClient, battery: BatteryStorage) -> 
             return DirectMethodResponse(request.request_id, 200, {"status": "ok"})
         except ValidationError as exc:
             logger.warning("Invalid payload", method=request.name, reason=str(exc))
-            return DirectMethodResponse(request.request_id, 400, {"error": exc.errors()})
+            return DirectMethodResponse(request.request_id, 400, {"error": exc.errors()})  # HTTP 400: bad payload schema
         except RuntimeError as exc:
             logger.warning("Method rejected", method=request.name, reason=str(exc))
-            return DirectMethodResponse(request.request_id, 409, {"error": str(exc)})
+            return DirectMethodResponse(request.request_id, 409, {"error": str(exc)})       # HTTP 409: wrong asset state
         except Exception as exc:
             logger.exception("Method handler error", method=request.name)
             return DirectMethodResponse(request.request_id, 500, {"error": str(exc)})
@@ -83,7 +83,7 @@ async def register_handlers(client: BaseEdgeClient, battery: BatteryStorage) -> 
     async def handle_twin_update(patch: dict) -> None:
         logger.info("Twin desired properties updated", patch=patch)
         if "max_power_kw" in patch:
-            battery.max_power_kw = float(patch["max_power_kw"])
+            battery.max_power_kw = float(patch["max_power_kw"])  # only max_power_kw is live-tunable via device twin
 
     client.on_method(handle_method)
     client.on_twin_update(handle_twin_update)

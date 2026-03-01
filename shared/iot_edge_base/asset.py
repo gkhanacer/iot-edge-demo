@@ -27,7 +27,7 @@ class BaseAsset(ABC):
         self.asset_id = asset_id
         self._state = AssetState.IDLE
         self._fault_code: str | None = None
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()  # serialises concurrent start/stop calls
 
     @property
     def state(self) -> AssetState:
@@ -40,6 +40,7 @@ class BaseAsset(ABC):
     async def start(self) -> None:
         async with self._lock:
             if self._state != AssetState.IDLE:
+                # start() is idempotent — silently ignored when already started or faulted
                 logger.warning("start() ignored", asset_id=self.asset_id, state=self._state)
                 return
             self._state = AssetState.STARTING
@@ -50,6 +51,7 @@ class BaseAsset(ABC):
 
     async def stop(self) -> None:
         async with self._lock:
+            # STARTING is included so stop() works during a slow _on_start() startup
             if self._state not in (AssetState.RUNNING, AssetState.STARTING):
                 return
             self._state = AssetState.STOPPING
@@ -58,12 +60,14 @@ class BaseAsset(ABC):
             logger.info("Asset stopped", asset_id=self.asset_id)
 
     async def fault(self, code: str) -> None:
+        # No lock: fault is an urgent override that must work from any state
         self._state = AssetState.FAULT
         self._fault_code = code
         await self._on_fault(code)
         logger.error("Asset fault", asset_id=self.asset_id, fault_code=code)
 
     async def reset(self) -> None:
+        # reset() is a no-op from any non-FAULT state — safe to call speculatively
         if self._state != AssetState.FAULT:
             return
         self._fault_code = None

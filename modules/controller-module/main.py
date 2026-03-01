@@ -70,14 +70,14 @@ async def _apply_balancing(
         if alert["code"] == "GRID_SURPLUS":
             logger.info("Balancing: surplus detected, increasing battery charge", balance_kw=balance)
             try:
-                await dispatcher.charge_battery(battery_module_id, power_kw=min(abs(balance), 50.0))
+                await dispatcher.charge_battery(battery_module_id, power_kw=min(abs(balance), 50.0))  # cap at 50 kW to protect battery
             except RuntimeError:
                 logger.warning("Could not command battery to charge")
 
         elif alert["code"] == "GRID_DEFICIT":
             logger.info("Balancing: deficit detected, requesting battery discharge", balance_kw=balance)
             try:
-                await dispatcher.discharge_battery(battery_module_id, power_kw=min(abs(balance), 50.0))
+                await dispatcher.discharge_battery(battery_module_id, power_kw=min(abs(balance), 50.0))  # cap at 50 kW to protect battery
             except RuntimeError:
                 logger.warning("Could not command battery to discharge")
 
@@ -142,6 +142,9 @@ async def main() -> None:
     loop.add_signal_handler(signal.SIGTERM, stop_event.set)
     loop.add_signal_handler(signal.SIGINT, stop_event.set)
 
+    # Two independent loops: cloud_reporting_loop sends summaries upstream,
+    # balancing_loop applies local control actions — decoupled so a reporting
+    # failure doesn't interrupt balancing and vice versa.
     tasks = [
         asyncio.create_task(cloud_reporting_loop()),
         asyncio.create_task(

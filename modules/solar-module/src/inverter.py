@@ -94,16 +94,16 @@ class SolarInverter(BaseAsset):
             SolarTelemetry snapshot.
         """
         if self._state == AssetState.RUNNING and irradiance_w_m2 > 0:
-            self._temperature_c = 25.0 + TEMP_RISE_FACTOR * irradiance_w_m2
-            efficiency = REFERENCE_EFFICIENCY * (1 - TEMP_COEFFICIENT * max(0.0, self._temperature_c - 25.0))
-            max_possible_kw = (irradiance_w_m2 / 1000.0) * self.max_power_kw * (efficiency / REFERENCE_EFFICIENCY)
-            self._current_power_kw = min(self._target_power_kw, max_possible_kw)
+            self._temperature_c = 25.0 + TEMP_RISE_FACTOR * irradiance_w_m2  # panel warms above STC under irradiance
+            efficiency = REFERENCE_EFFICIENCY * (1 - TEMP_COEFFICIENT * max(0.0, self._temperature_c - 25.0))  # temperature derating
+            max_possible_kw = (irradiance_w_m2 / 1000.0) * self.max_power_kw * (efficiency / REFERENCE_EFFICIENCY)  # irradiance fraction × nameplate × efficiency ratio
+            self._current_power_kw = min(self._target_power_kw, max_possible_kw)  # setpoint is an upper limit; physics may supply less
         else:
             self._current_power_kw = 0.0
             if self._state != AssetState.RUNNING:
-                self._temperature_c = 25.0
+                self._temperature_c = 25.0  # reset to STC when not operating
 
-        efficiency = REFERENCE_EFFICIENCY * (1 - TEMP_COEFFICIENT * max(0.0, self._temperature_c - 25.0))
+        efficiency = REFERENCE_EFFICIENCY * (1 - TEMP_COEFFICIENT * max(0.0, self._temperature_c - 25.0))  # recalculate for the telemetry snapshot
 
         return SolarTelemetry(
             asset_id=self.asset_id,
@@ -118,8 +118,8 @@ class SolarInverter(BaseAsset):
     # ── BaseAsset hooks ────────────────────────────────────────────────────────
 
     async def _on_start(self) -> None:
-        await asyncio.sleep(self._startup_delay_s)
-        self._target_power_kw = self.max_power_kw
+        await asyncio.sleep(self._startup_delay_s)  # simulates inverter boot / MPPT initialisation time
+        self._target_power_kw = self.max_power_kw   # default to full output after startup
 
     async def _on_stop(self) -> None:
         self._current_power_kw = 0.0

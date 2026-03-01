@@ -34,7 +34,7 @@ class AzureMonitorExporter:
     """
 
     def __init__(self, connection_string: str) -> None:
-        self._latest: dict = {}
+        self._latest: dict = {}  # updated by update(); read by OTel callbacks — dict assignment is atomic under CPython's GIL
 
         otel_exporter = AzureMonitorMetricExporter(connection_string=connection_string)
         reader = PeriodicExportingMetricReader(
@@ -87,7 +87,7 @@ class AzureMonitorExporter:
 
     def _cb_grid_balance(self, options) -> list[Observation]:
         device_id = self._latest.get("device_id", "unknown")
-        return [Observation(self._latest.get("grid_balance_kw", 0.0), {"device_id": device_id})]
+        return [Observation(self._latest.get("grid_balance_kw", 0.0), {"device_id": device_id})]  # device_id dimension enables multi-device dashboards
 
     def _cb_generation(self, options) -> list[Observation]:
         return [Observation(self._latest.get("total_generation_kw", 0.0))]

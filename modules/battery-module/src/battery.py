@@ -145,6 +145,7 @@ class BatteryStorage(BaseAsset):
     def tick(self, elapsed_s: float) -> None:
         """Advance the SoC simulation by elapsed_s seconds."""
         if self._mode == BatteryMode.CHARGING:
+            # energy stored = power × efficiency × time; /3600 converts seconds to hours
             delta_kwh = (self._power_kw * CHARGE_EFFICIENCY * elapsed_s) / 3600.0
             self._soc = min(SOC_MAX, self._soc + delta_kwh / self.capacity_kwh)
             if self._soc >= SOC_MAX:
@@ -153,6 +154,7 @@ class BatteryStorage(BaseAsset):
                 logger.info("Battery fully charged", asset_id=self.asset_id)
 
         elif self._mode == BatteryMode.DISCHARGING:
+            # energy drawn from battery exceeds energy delivered (inverse efficiency)
             delta_kwh = (abs(self._power_kw) / DISCHARGE_EFFICIENCY * elapsed_s) / 3600.0
             self._soc = max(SOC_MIN, self._soc - delta_kwh / self.capacity_kwh)
             if self._soc <= SOC_MIN:
@@ -160,7 +162,7 @@ class BatteryStorage(BaseAsset):
                 self._mode = BatteryMode.IDLE
                 logger.info("Battery depleted", asset_id=self.asset_id)
 
-        # Temperature rises slightly under load
+        # Temperature rises proportionally to absolute power (same model for charge and discharge)
         self._temperature_c = 25.0 + 0.05 * abs(self._power_kw)
 
     def get_telemetry(self) -> BatteryTelemetry:

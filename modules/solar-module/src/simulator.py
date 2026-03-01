@@ -20,10 +20,10 @@ def get_irradiance(hour_of_day: float | None = None) -> float:
     """
     if hour_of_day is None:
         now = datetime.now(timezone.utc)
-        hour_of_day = now.hour + now.minute / 60.0
+        hour_of_day = now.hour + now.minute / 60.0  # fractional hour, e.g. 13.5 = 13:30
 
     if hour_of_day < 6.0 or hour_of_day > 18.0:
         return 0.0
 
-    angle = math.pi * (hour_of_day - 6.0) / 12.0
+    angle = math.pi * (hour_of_day - 6.0) / 12.0  # maps [6, 18] to [0, π] so sin peaks at noon (π/2)
     return round(1000.0 * math.sin(angle), 1)

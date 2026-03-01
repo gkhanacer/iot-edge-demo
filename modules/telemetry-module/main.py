@@ -32,10 +32,11 @@ async def main() -> None:
     client = create_client()
     await client.connect()
 
-    exporter: AzureMonitorExporter | None = None
+    exporter: AzureMonitorExporter | None = None  # None when no connection string; handle_controller_telemetry checks before calling update()
     if connection_string:
         exporter = AzureMonitorExporter(connection_string=connection_string)
     else:
+        # Module runs without exporting — useful in local dev where Azure credentials aren't available
         logger.warning("AZURE_MONITOR_CONNECTION_STRING not set — metrics export disabled")
 
     async def handle_controller_telemetry(data: dict, input_name: str) -> None:

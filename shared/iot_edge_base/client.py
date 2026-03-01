@@ -282,19 +282,19 @@ class LocalMqttEdgeClient(BaseEdgeClient):
         timeout_s: int = 10,
     ) -> dict:
         loop = asyncio.get_running_loop()
-        request_id = f"{method_name}-{loop.time():.6f}"
+        request_id = f"{method_name}-{loop.time():.6f}"  # monotonic loop time gives a unique, sortable correlation ID
 
         # Embed request_id so the target module echoes it back in the response topic
         outgoing = {**payload, "_request_id": request_id}
         topic = f"edge/{target_module_id}/methods/{method_name}"
 
         future: asyncio.Future[dict] = loop.create_future()
-        self._pending[request_id] = future
+        self._pending[request_id] = future  # resolved by _dispatch() when the response topic arrives
 
         await self._client.publish(topic, json.dumps(outgoing))
 
         try:
-            return await asyncio.wait_for(future, timeout=timeout_s)
+            return await asyncio.wait_for(future, timeout=timeout_s)  # blocks until remote module responds
         except asyncio.TimeoutError:
             self._pending.pop(request_id, None)
             raise RuntimeError(

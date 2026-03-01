@@ -56,8 +56,9 @@ async def register_handlers(client: BaseEdgeClient, boiler: Boiler) -> None:
             return DirectMethodResponse(request.request_id, 200, {"status": "ok"})
         except ValidationError as exc:
             logger.warning("Invalid payload", method=request.name, reason=str(exc))
-            return DirectMethodResponse(request.request_id, 400, {"error": exc.errors()})
+            return DirectMethodResponse(request.request_id, 400, {"error": exc.errors()})  # HTTP 400: bad payload schema
         except (RuntimeError, ValueError) as exc:
+            # RuntimeError = wrong state; ValueError = unsafe temperature — both map to HTTP 409
             logger.warning("Method rejected", method=request.name, reason=str(exc))
             return DirectMethodResponse(request.request_id, 409, {"error": str(exc)})
         except Exception as exc:
@@ -66,6 +67,7 @@ async def register_handlers(client: BaseEdgeClient, boiler: Boiler) -> None:
 
     async def handle_twin_update(patch: dict) -> None:
         logger.info("Twin desired properties updated", patch=patch)
+        # Guard: silently ignored when not RUNNING — applying a setpoint to an idle boiler has no effect
         if "default_target_c" in patch and boiler.state == AssetState.RUNNING:
             await boiler.set_temperature(float(patch["default_target_c"]))
 
