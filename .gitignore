@@ -36,3 +36,5 @@ Thumbs.db
 *.pem
 *.key
 local.settings.json
+
+myagent/

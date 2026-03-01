@@ -10,6 +10,7 @@ python = "^3.11"
 azure-iot-device = "2.14.0"
 structlog = ">=24.0"
 asyncio-mqtt = ">=0.16"
+pydantic-settings = ">=2.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0"

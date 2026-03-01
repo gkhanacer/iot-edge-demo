@@ -4,6 +4,7 @@ Aggregates asset snapshots into a single cloud-bound payload and
 determines grid balance / control actions needed.
 """
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -28,6 +29,7 @@ class AggregatedTelemetry:
     asset_count: int
     assets: dict[str, dict]
     alerts: list[dict] = field(default_factory=list)
+    message_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def to_dict(self) -> dict:
         return {
@@ -39,6 +41,7 @@ class AggregatedTelemetry:
             "asset_count": self.asset_count,
             "assets": self.assets,
             "alerts": self.alerts,
+            "message_id": self.message_id,
         }
 
 

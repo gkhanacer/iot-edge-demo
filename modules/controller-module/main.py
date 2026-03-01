@@ -6,13 +6,14 @@ a summary payload to Azure IoT Hub ($upstream).
 """
 
 import asyncio
-import os
 import signal
 
 import structlog
 
 from iot_edge_base.client import create_client
+from iot_edge_base.retry import with_retry
 from src.aggregator import Aggregator
+from src.config import ControllerConfig
 from src.dispatcher import CommandDispatcher
 from src.registry import AssetRegistry
 
@@ -25,30 +26,19 @@ structlog.configure(
 )
 logger = structlog.get_logger()
 
-DEVICE_ID = os.environ.get("IOTEDGE_DEVICEID", "edge-device-01")
-REPORTING_INTERVAL_S = int(os.environ.get("REPORTING_INTERVAL_S", "30"))
-SURPLUS_THRESHOLD_KW = float(os.environ.get("SURPLUS_THRESHOLD_KW", "10.0"))
-
-# Module IDs of connected asset modules (must match deployment manifest)
-SOLAR_MODULE_ID = os.environ.get("SOLAR_MODULE_ID", "solar-module")
-BATTERY_MODULE_ID = os.environ.get("BATTERY_MODULE_ID", "battery-module")
-BOILER_MODULE_ID = os.environ.get("BOILER_MODULE_ID", "boiler-module")
-
 
 async def balancing_loop(
     registry: AssetRegistry,
     aggregator: Aggregator,
     dispatcher: CommandDispatcher,
+    battery_module_id: str,
+    interval_s: int,
 ) -> None:
     """Periodically aggregate telemetry, run balancing logic, report to cloud."""
     while True:
         try:
             telemetry = await aggregator.compute(registry)
-            await _apply_balancing(telemetry, registry, dispatcher)
-
-            # Forward to IoT Hub via $upstream
-            from iot_edge_base.client import BaseEdgeClient  # avoid circular at module level
-
+            await _apply_balancing(telemetry, dispatcher, battery_module_id)
             logger.info(
                 "Grid report",
                 generation_kw=telemetry.total_generation_kw,
@@ -56,14 +46,17 @@ async def balancing_loop(
                 balance_kw=telemetry.grid_balance_kw,
                 alerts=len(telemetry.alerts),
             )
-
         except Exception:
             logger.exception("Balancing loop error")
 
-        await asyncio.sleep(REPORTING_INTERVAL_S)
+        await asyncio.sleep(interval_s)
 
 
-async def _apply_balancing(telemetry, registry, dispatcher: CommandDispatcher) -> None:
+async def _apply_balancing(
+    telemetry,
+    dispatcher: CommandDispatcher,
+    battery_module_id: str,
+) -> None:
     """Simple rule-based grid balancing.
 
     Rules:
@@ -72,20 +65,19 @@ async def _apply_balancing(telemetry, registry, dispatcher: CommandDispatcher) -
       - Asset in FAULT: log critical alert (escalation handled externally)
     """
     balance = telemetry.grid_balance_kw
-    battery = await registry.get(BATTERY_MODULE_ID.replace("-module", "-01"))  # asset_id convention
 
     for alert in telemetry.alerts:
         if alert["code"] == "GRID_SURPLUS":
             logger.info("Balancing: surplus detected, increasing battery charge", balance_kw=balance)
             try:
-                await dispatcher.charge_battery(BATTERY_MODULE_ID, power_kw=min(abs(balance), 50.0))
+                await dispatcher.charge_battery(battery_module_id, power_kw=min(abs(balance), 50.0))
             except RuntimeError:
                 logger.warning("Could not command battery to charge")
 
         elif alert["code"] == "GRID_DEFICIT":
             logger.info("Balancing: deficit detected, requesting battery discharge", balance_kw=balance)
             try:
-                await dispatcher.discharge_battery(BATTERY_MODULE_ID, power_kw=min(abs(balance), 50.0))
+                await dispatcher.discharge_battery(battery_module_id, power_kw=min(abs(balance), 50.0))
             except RuntimeError:
                 logger.warning("Could not command battery to discharge")
 
@@ -98,11 +90,13 @@ async def _apply_balancing(telemetry, registry, dispatcher: CommandDispatcher) -
 
 
 async def main() -> None:
+    cfg = ControllerConfig()
+
     client = create_client()
     await client.connect()
 
     registry = AssetRegistry()
-    aggregator = Aggregator(device_id=DEVICE_ID, surplus_threshold_kw=SURPLUS_THRESHOLD_KW)
+    aggregator = Aggregator(device_id=cfg.device_id, surplus_threshold_kw=cfg.surplus_threshold_kw)
     dispatcher = CommandDispatcher(client)
 
     # Register input message handler — receives telemetry from all asset modules
@@ -120,22 +114,28 @@ async def main() -> None:
         while True:
             try:
                 telemetry = await aggregator.compute(registry)
-                await client.send_message_to_output(telemetry.to_dict(), output_name="cloud")
-                await client.update_reported_properties(
-                    {
-                        "asset_count": telemetry.asset_count,
-                        "grid_balance_kw": telemetry.grid_balance_kw,
-                        "active_alerts": len(telemetry.alerts),
-                    }
+                await with_retry(
+                    lambda: client.send_message_to_output(telemetry.to_dict(), output_name="cloud"),
+                    label="controller.send_cloud",
+                )
+                await with_retry(
+                    lambda: client.update_reported_properties(
+                        {
+                            "asset_count": telemetry.asset_count,
+                            "grid_balance_kw": telemetry.grid_balance_kw,
+                            "active_alerts": len(telemetry.alerts),
+                        }
+                    ),
+                    label="controller.update_twin",
                 )
             except Exception:
                 logger.exception("Cloud reporting error")
-            await asyncio.sleep(REPORTING_INTERVAL_S)
+            await asyncio.sleep(cfg.reporting_interval_s)
 
     client.on_message(handle_asset_telemetry)
 
-    await client.update_reported_properties({"device_id": DEVICE_ID, "role": "controller"})
-    logger.info("Controller module ready", device_id=DEVICE_ID)
+    await client.update_reported_properties({"device_id": cfg.device_id, "role": "controller"})
+    logger.info("Controller module ready", device_id=cfg.device_id)
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -144,7 +144,9 @@ async def main() -> None:
 
     tasks = [
         asyncio.create_task(cloud_reporting_loop()),
-        asyncio.create_task(balancing_loop(registry, aggregator, dispatcher)),
+        asyncio.create_task(
+            balancing_loop(registry, aggregator, dispatcher, cfg.battery_module_id, cfg.reporting_interval_s)
+        ),
     ]
 
     await stop_event.wait()

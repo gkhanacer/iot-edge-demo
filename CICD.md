@@ -94,17 +94,39 @@ deployInfraProd=true  (everything else unchecked)
 
 **Files:** [`azure-pipelines.yml`](azure-pipelines.yml) · [`pipelines/templates/test-module.yml`](pipelines/templates/test-module.yml)
 
-Always runs on every push and PR.
+Always runs on every push and PR. Triggers on changes under `modules/`, `shared/`, `infra/`, `deployment/`.
 
-**TestModules** (matrix — 5 parallel jobs):
-1. Install Python 3.12 + Poetry 1.8.3
-2. `pip install` the shared `iot_edge_base` package
-3. `poetry install` module dependencies
-4. `pytest` with coverage — results published to Azure DevOps
+**TestModules** (matrix — 5 parallel jobs, one per module):
 
-**LintAndTypeCheck:**
+```yaml
+# pipelines/templates/test-module.yml (simplified)
+steps:
+  - task: UsePythonVersion@0       # Python 3.12
+  - script: pip install poetry==1.8.3
+  - script: |
+      pip install /shared           # install iot_edge_base shared package
+      cd modules/<moduleName>
+      poetry install --no-root      # install module + dev deps from poetry.lock
+  - script: |
+      cd modules/<moduleName>
+      poetry run pytest tests \
+        --cov=src \
+        --cov-report=xml:../../coverage-<module>.xml \
+        --junitxml=../../test-results-<module>.xml \
+        -v
+    env:
+      EDGE_MODE: local              # activates LocalMqttEdgeClient (no Azure SDK)
+  - task: PublishTestResults@2
+  - task: PublishCodeCoverageResults@2
+```
+
+`EDGE_MODE: local` switches the client factory to `LocalMqttEdgeClient`, so tests run without an Azure IoT Hub connection. Config classes (`BatteryConfig`, `SolarConfig`, etc.) are validated by **pydantic-settings** at import time — misconfigured env vars fail fast with a precise error before a single test runs.
+
+> **Dependency note:** Each module's `poetry.lock` must include `pydantic-settings`. The Dockerfile runs `poetry install --only main` which reads from the lockfile — running `poetry lock` in each module directory after adding the dependency keeps the lockfiles up to date.
+
+**LintAndTypeCheck** (parallel to TestModules):
 - **Ruff** — fast linting across all modules and shared package
-- **Mypy** — static type checking per module (non-blocking)
+- **Mypy** — static type checking per module (non-blocking, `|| true`)
 
 ---
 
@@ -112,7 +134,7 @@ Always runs on every push and PR.
 
 **Files:** [`infra/main.bicep`](infra/main.bicep) · [`infra/main.bicepparam`](infra/main.bicepparam)
 
-Each environment is an **independent** stage — runs only when the corresponding `deployInfra*` parameter is checked. They all depend on Test passing, but not on each other or on edge deployments.
+Each environment is an **independent** stage — runs only when the corresponding `deployInfra*` parameter is checked. All three depend on Test passing, but not on each other or on edge deployments.
 
 Azure resources deployed per environment:
 
@@ -132,7 +154,7 @@ Uses `deployment:` job type → deployment history is tracked per environment in
 
 **File:** [`pipelines/templates/build-module.yml`](pipelines/templates/build-module.yml)
 
-Runs **once**, builds all 5 modules in parallel. Images are pushed to the **shared `$(ACR_LOGIN_SERVER)`** and reused across all environments — no rebuild per env.
+Runs **once** after Test passes and at least one edge deployment is requested. Builds all 5 modules in parallel. Images are pushed to the **shared `$(ACR_LOGIN_SERVER)`** and reused across all environments — no rebuild per env.
 
 **Image tagging:**
 
@@ -141,7 +163,7 @@ Runs **once**, builds all 5 modules in parallel. Images are pushed to the **shar
 | `main` | `3.14` (from `VERSION` file) | Yes |
 | any other | `3.14-abc12345` (version + 8-char SHA) | No |
 
-Uses `az acr build` — build runs on ACR's cloud agent, no Docker daemon needed on the pipeline agent. Authenticates via the existing `azure-prod-sc` service connection.
+Uses `az acr build` — the build runs on ACR's cloud agent. No local Docker daemon is required on the pipeline agent. Authenticates via the `$(AZURE_SERVICE_CONNECTION)` service connection.
 
 ---
 
@@ -149,7 +171,14 @@ Uses `az acr build` — build runs on ACR's cloud agent, no Docker daemon needed
 
 **File:** [`deployment/deployment.template.json`](deployment/deployment.template.json)
 
-Deploy stages depend only on **Build** and the **previous environment's deploy** (for promotion chain). They do **not** depend on Infra stages — infrastructure is managed independently.
+Deploy stages depend only on **Build** and the **previous environment's deploy** (promotion chain). They do **not** depend on Infra stages — infrastructure is managed independently.
+
+Before deploying, the pipeline substitutes template variables into the deployment manifest:
+
+```bash
+sed -i "s|\$CONTAINER_REGISTRY_ADDRESS|$(ACR_LOGIN_SERVER)|g" deployment/deployment.template.json
+sed -i "s|\$MODULE_VERSION|$(Build.BuildId)|g" deployment/deployment.template.json
+```
 
 **Single device** (`target=single`):
 ```bash
@@ -208,13 +237,13 @@ Three environments must be created in Azure DevOps → Pipelines → Environment
 
 ## Service Connection
 
-A single Azure Resource Manager service connection **`azure-prod-sc`** is used for all Azure interactions (Bicep deploy, ACR build, IoT Edge deploy). Backed by a Service Principal with `Contributor` role on the subscription.
+A single Azure Resource Manager service connection **`azure-prod-sc`** is used for all Azure interactions (Bicep deploy, `az acr build`, IoT Edge deploy). Backed by a Service Principal with `Contributor` role on the subscription.
 
 ---
 
 ## Version File
 
-[`VERSION`](VERSION) at the repo root controls the base image version. To bump the version, update this file and commit — the next build will use the new tag.
+[`VERSION`](VERSION) at the repo root controls the base image version. To release a new version, update this file and merge to `main` — the pipeline tags the images and pushes `latest` automatically.
 
 ```
 3.14
@@ -224,11 +253,25 @@ A single Azure Resource Manager service connection **`azure-prod-sc`** is used f
 
 ## Local Development
 
-The full stack runs locally without Azure using Docker Compose + Mosquitto MQTT:
+The full stack runs locally without Azure using Docker Compose + Mosquitto MQTT. See [README.md](README.md) for the complete local testing guide, including how to send direct method commands over MQTT and verify grid balance output.
 
 ```bash
 cd deployment
-docker compose up --build
+docker compose up --build -d
 ```
 
-See [`deployment/docker-compose.yml`](deployment/docker-compose.yml).
+To run tests locally for a single module:
+
+```bash
+cd modules/battery-module
+EDGE_MODE=local poetry run pytest tests/ -v
+```
+
+To run all modules from the repo root:
+
+```bash
+for module in solar-module battery-module boiler-module controller-module; do
+  echo "=== $module ==="
+  (cd modules/$module && EDGE_MODE=local poetry run pytest tests/ -v)
+done
+```

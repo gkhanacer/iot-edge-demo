@@ -5,6 +5,7 @@ PID-like convergence simulation.
 """
 
 import asyncio
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -33,6 +34,7 @@ class BoilerTelemetry:
     pressure_bar: float = 1.0
     fault_code: str | None = None
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    message_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def to_dict(self) -> dict:
         return {
@@ -46,6 +48,7 @@ class BoilerTelemetry:
             "pressure_bar": self.pressure_bar,
             "fault_code": self.fault_code,
             "timestamp": self.timestamp,
+            "message_id": self.message_id,
         }
 
 

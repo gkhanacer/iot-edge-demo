@@ -2,7 +2,7 @@
 
 ## Overview
 
-An Azure IoT Edge–based platform that manages and steers decentralized energy assets (solar inverters, batteries, industrial boilers) from an edge device. Each asset type runs as an independent IoT Edge module. A central controller module aggregates telemetry, makes control decisions, and reports to Azure IoT Hub in the cloud.
+An Azure IoT Edge–based platform that manages and steers decentralized energy assets (solar inverters, batteries, industrial boilers) from an edge device. Each asset type runs as an independent IoT Edge module. A central controller module aggregates telemetry, makes grid-balancing decisions, and reports to Azure IoT Hub in the cloud.
 
 ---
 
@@ -16,12 +16,10 @@ An Azure IoT Edge–based platform that manages and steers decentralized energy 
 │  │                        │    │    Log Analytics     │    │  Registry (ACR)      │ │
 │  │  - Device/Module Twin  │    │                      │    │  - Module images     │ │
 │  │  - D2C telemetry       │    │  - Metrics & Logs    │    └──────────────────────┘ │
-│  │  - C2D commands        │    │  - Alerts            │                             │
-│  │  - Direct methods      │    │  - Dashboards        │                             │
+│  │  - Direct methods      │    │  - Alerts            │                             │
 │  └───────────┬────────────┘    └──────────────────────┘                             │
-│              │ Diagnostic Settings (auto-forwarded)                                  │
+│              │ MQTT/AMQP over TLS ($upstream)                                        │
 └──────────────┼───────────────────────────────────────────────────────────────────── ┘
-               │ MQTT/AMQP over TLS ($upstream)
                │
 ┌──────────────┼────────────────── IoT EDGE DEVICE ──────────────────────────────────┐
 │              │                                                                       │
@@ -38,16 +36,15 @@ An Azure IoT Edge–based platform that manages and steers decentralized energy 
 │  ┌────────▼───┐  ┌───────▼────┐  ┌─────▼──────┐  ┌─────────────────────────────┐ │
 │  │solar-module│  │battery-    │  │boiler-     │  │    controller-module          │ │
 │  │            │  │module      │  │module      │  │                               │ │
-│  │ Simulator  │  │ Simulator  │  │ Simulator  │  │  - Aggregates telemetry       │ │
-│  │ + Driver   │  │ + Driver   │  │ + Driver   │  │  - Grid balance decisions     │ │
-│  │            │  │            │  │            │  │  - Issues direct method calls │ │
-│  │ Prometheus │  │ Prometheus │  │ Prometheus │  │  - Reports to IoT Hub         │ │
-│  │ /metrics   │  │ /metrics   │  │ /metrics   │  │                               │ │
+│  │ Inverter   │  │ Storage    │  │ Boiler     │  │  - Aggregates telemetry       │ │
+│  │ Driver +   │  │ Driver +   │  │ Driver +   │  │  - Grid balance decisions     │ │
+│  │ Irradiance │  │ SoC Sim    │  │ Temp Sim   │  │  - Issues direct methods      │ │
+│  │ Simulator  │  │            │  │            │  │  - Reports to IoT Hub         │ │
 │  └────────────┘  └────────────┘  └────────────┘  └───────────────────────────────┘ │
 │                                                                                       │
 │  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
 │  │                         telemetry-module                                        │ │
-│  │   Scrapes Prometheus /metrics from all modules → Azure Monitor agent            │ │
+│  │   Receives aggregated telemetry → forwards to Azure Monitor                     │ │
 │  └─────────────────────────────────────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -60,83 +57,108 @@ Azure IoT Edge modules communicate via **three mechanisms**, each serving a diff
 
 ### 1. Message Routing (edgeHub) — Telemetry / Events
 
-Used for fire-and-forget telemetry from asset modules to the controller. The edgeHub acts as a local message broker.
+Used for fire-and-forget telemetry from asset modules to the controller. edgeHub acts as a local message broker; the controller receives telemetry from all three asset modules on the same `telemetry` input.
 
 ```
-solar-module
-  └─ output: "telemetry"
-       └─▶ edgeHub routing
-             └─▶ controller-module input: "telemetry"
+solar-module   ──▶ output: "telemetry"
+battery-module ──▶ output: "telemetry"  ──▶ edgeHub ──▶ controller-module input: "telemetry"
+boiler-module  ──▶ output: "telemetry"
+                                                    │
+                                             controller-module ──▶ output: "cloud"
+                                                                      │
+                                                               edgeHub ($upstream)
+                                                                      │
+                                                               Azure IoT Hub
 ```
 
-**Python (sender — asset module):**
+**Sender (asset module):**
 ```python
-msg = Message(json.dumps(telemetry_dict))
-msg.content_type = "application/json"
-await client.send_message_to_output(msg, "telemetry")
+await client.send_message_to_output(telemetry.to_dict(), output_name="telemetry")
 ```
 
-**Python (receiver — controller-module):**
+**Receiver (controller-module):**
 ```python
-async def handle_input_message(message):
-    data = json.loads(message.data)
-    await aggregator.ingest(data)
+async def handle_asset_telemetry(data: dict, input_name: str) -> None:
+    await registry.update(data)
 
-client.on_message_received = handle_input_message
-```
-
-**deployment.template.json routing:**
-```json
-"solarToController": "FROM /messages/modules/solar-module/outputs/telemetry
-                      INTO BrokeredEndpoint(\"/modules/controller-module/inputs/telemetry\")"
+client.on_message(handle_asset_telemetry)
 ```
 
 ---
 
 ### 2. Direct Methods — Commands (Request/Response)
 
-Used by the controller to send commands to asset modules. Has a timeout and a synchronous response.
+Used by the controller to send commands to asset modules. Synchronous: the caller blocks until a response arrives or the timeout elapses.
 
 ```
 controller-module
-  └─▶ invoke_method("solar-module", "set_output", {"target_kw": 30})
-        └─▶ solar-module handles and responds
-              └─▶ {"status": "ok", "actual_kw": 30.0}
+  └─▶ invoke_method("battery-module", "start_charging", {"power_kw": 50.0})
+        └─▶ battery-module handles → 200 {"status": "ok"}
 ```
 
-**Python (caller — controller-module):**
+**Caller (controller-module):**
 ```python
 response = await client.invoke_method(
-    method_params={"methodName": "set_output", "payload": {"target_kw": 30.0}, "responseTimeoutInSeconds": 10},
-    device_id=os.environ["IOTEDGE_DEVICEID"],
-    module_id="solar-module",
+    target_module_id="battery-module",
+    method_name="start_charging",
+    payload={"power_kw": 50.0},
 )
 ```
 
-**Python (handler — asset module):**
+**Handler (asset module) — dispatch dict pattern:**
 ```python
-async def method_handler(method_request):
-    if method_request.name == "set_output":
-        await inverter.set_output(method_request.payload["target_kw"])
-        return MethodResponse.create_from_method_request(method_request, 200, {"status": "ok"})
+# Each method maps to a typed handler. No if/elif chain needed.
+def _build_dispatch(battery: BatteryStorage) -> dict:
+    async def _start_charging(payload: dict) -> None:
+        parsed = StartChargingPayload.model_validate(payload)   # ← boundary validation
+        power_kw = parsed.power_kw or battery.max_power_kw
+        await battery.start_charging(power_kw)
+    return {"start_charging": _start_charging, ...}
 
-client.on_method_request_received = method_handler
+# Generic handle_method — same in every module
+async def handle_method(request: DirectMethodRequest) -> DirectMethodResponse:
+    handler = dispatch.get(request.name)
+    if handler is None:
+        return DirectMethodResponse(request.request_id, 404, {...})
+    try:
+        await handler(request.payload)
+        return DirectMethodResponse(request.request_id, 200, {"status": "ok"})
+    except ValidationError as exc:                              # invalid payload
+        return DirectMethodResponse(request.request_id, 400, {"error": exc.errors()})
+    except RuntimeError as exc:                                 # wrong state
+        return DirectMethodResponse(request.request_id, 409, {"error": str(exc)})
+    except Exception as exc:
+        return DirectMethodResponse(request.request_id, 500, {"error": str(exc)})
 ```
 
 **Available commands per module:**
 
-| Module | Method | Payload |
-|--------|--------|---------|
-| solar-module | `start` | — |
-| solar-module | `stop` | — |
-| solar-module | `set_output` | `{"target_kw": float}` |
-| solar-module | `reset` | — |
-| battery-module | `start_charging` | `{"power_kw": float}` |
-| battery-module | `start_discharging` | `{"power_kw": float}` |
-| battery-module | `stop` | — |
-| boiler-module | `start` | — |
-| boiler-module | `stop` | — |
-| boiler-module | `set_temperature` | `{"target_celsius": float}` |
+| Module | Method | Payload | Constraints |
+|--------|--------|---------|------------|
+| `solar-module` | `start` | — | |
+| `solar-module` | `stop` | — | |
+| `solar-module` | `set_output` | `{"target_kw": float}` | `target_kw ≥ 0` |
+| `solar-module` | `reset` | — | |
+| `battery-module` | `start` | — | |
+| `battery-module` | `stop` | — | |
+| `battery-module` | `set_idle` | — | |
+| `battery-module` | `start_charging` | `{"power_kw": float}` (optional) | `power_kw > 0` if provided |
+| `battery-module` | `start_discharging` | `{"power_kw": float}` (optional) | `power_kw > 0` if provided |
+| `battery-module` | `reset` | — | |
+| `boiler-module` | `start` | — | |
+| `boiler-module` | `stop` | — | |
+| `boiler-module` | `set_temperature` | `{"target_celsius": float}` | `40 ≤ target_celsius ≤ 120` |
+| `boiler-module` | `reset` | — | |
+
+**Response codes:**
+
+| Code | Meaning |
+|------|---------|
+| `200` | Command accepted and executed |
+| `400` | Invalid payload — Pydantic `ValidationError` (wrong type, out-of-range value) |
+| `404` | Unknown method name |
+| `409` | Valid payload but illegal in current state (e.g. charging while not RUNNING) |
+| `500` | Unexpected error in handler |
 
 ---
 
@@ -146,73 +168,174 @@ Used for persistent configuration. The cloud (or operator) updates desired prope
 
 ```
 IoT Hub (desired properties)
-  └─▶ {"max_output_kw": 80.0, "fault_threshold": 0.85}
+  └─▶ {"max_power_kw": 80.0}
         └─▶ solar-module twin patch handler
-              └─▶ applies new config
-                    └─▶ reports back: {"max_output_kw": 80.0, "state": "RUNNING"}
+              └─▶ inverter.max_power_kw = 80.0
+                    └─▶ reports back: {"state": "RUNNING", "power_output_kw": 78.2}
 ```
 
 **Python:**
 ```python
-async def twin_patch_handler(patch):
-    if "max_output_kw" in patch:
-        inverter.max_power_kw = float(patch["max_output_kw"])
+async def handle_twin_update(patch: dict) -> None:
+    if "max_power_kw" in patch:
+        inverter.max_power_kw = float(patch["max_power_kw"])
 
-client.on_twin_desired_properties_patch_received = twin_patch_handler
-```
-
----
-
-## Telemetry Message Format
-
-All asset modules send JSON messages with this envelope:
-
-```json
-{
-  "asset_id": "solar-01",
-  "asset_type": "solar_inverter",
-  "state": "RUNNING",
-  "timestamp": "2024-06-01T12:00:00Z",
-  "power_output_kw": 42.5,
-  "irradiance_w_m2": 850.0,
-  "efficiency": 0.178,
-  "temperature_c": 42.0,
-  "fault_code": null
-}
-```
-
-The controller aggregates these and sends a rolled-up message to `$upstream`:
-
-```json
-{
-  "device_id": "edge-device-01",
-  "timestamp": "2024-06-01T12:00:00Z",
-  "total_power_kw": 185.3,
-  "assets": { ... },
-  "grid_balance_kw": 12.5,
-  "alerts": []
-}
+client.on_twin_update(handle_twin_update)
 ```
 
 ---
 
 ## Asset State Machine
 
-All asset modules implement the same state machine pattern:
+All asset modules implement the same lifecycle state machine via `BaseAsset`. Subclasses implement `_on_start`, `_on_stop`, and `_on_fault` hooks — they never manipulate `_state` directly.
 
 ```
             start()
   IDLE ──────────────▶ STARTING
    ▲                       │
-   │                       │ (startup complete)
+   │                       │ (startup delay complete)
    │ reset()               ▼
-   │              ┌──── RUNNING
-   │              │         │
-   │         fault()    stop()
-   │              │         │
-   │              ▼         ▼
-   └────────── FAULT     STOPPING ──▶ IDLE
+   │              ┌──── RUNNING ────┐
+   │              │                 │
+   │         fault(code)        stop()
+   │              │                 │
+   │              ▼                 ▼
+   └────────── FAULT            STOPPING ──▶ IDLE
 ```
+
+Battery additionally tracks a **mode** (sub-state) independently of the lifecycle state:
+
+```
+BatteryStorage._state  →  IDLE | STARTING | RUNNING | STOPPING | FAULT  (from BaseAsset)
+BatteryStorage._mode   →  IDLE | CHARGING | DISCHARGING                  (battery-specific)
+```
+
+`start_charging()` and `start_discharging()` require `_state == RUNNING`. The mode is reset to IDLE on `stop()` and `set_idle()`.
+
+---
+
+## Telemetry Message Format
+
+Every telemetry message includes a `message_id` (UUID v4) generated at publish time. The same ID is preserved across retry attempts, enabling downstream deduplication.
+
+**Asset module telemetry (solar example):**
+```json
+{
+  "asset_id": "solar-01",
+  "asset_type": "solar_inverter",
+  "state": "RUNNING",
+  "power_output_kw": 45.9,
+  "irradiance_w_m2": 850.0,
+  "efficiency": 0.1766,
+  "temperature_c": 42.0,
+  "fault_code": null,
+  "timestamp": "2026-03-01T07:54:34.370Z",
+  "message_id": "3f8a1c2d-4e5b-6789-abcd-ef0123456789"
+}
+```
+
+**Controller aggregated telemetry (sent to `$upstream`):**
+```json
+{
+  "device_id": "edge-device-01",
+  "timestamp": "2026-03-01T07:54:44.318Z",
+  "total_generation_kw": 45.9,
+  "total_consumption_kw": 50.0,
+  "grid_balance_kw": -4.1,
+  "asset_count": 3,
+  "assets": {
+    "solar-01":   {"state": "RUNNING",  "power_kw": 45.9,  "asset_type": "solar_inverter"},
+    "battery-01": {"state": "RUNNING",  "power_kw": -50.0, "asset_type": "battery_storage"},
+    "boiler-01":  {"state": "IDLE",     "power_kw": 0.0,   "asset_type": "industrial_boiler"}
+  },
+  "alerts": [],
+  "message_id": "7a2b3c4d-5e6f-7890-bcde-f01234567890"
+}
+```
+
+Grid balance convention: positive = surplus (generation > consumption), negative = deficit.
+
+---
+
+## Grid Balancing Logic
+
+The controller runs a rule-based balancing loop every `reporting_interval_s` seconds:
+
+| Condition | Action |
+|-----------|--------|
+| `grid_balance > surplus_threshold_kw` | Command battery to charge at `min(surplus, 50 kW)` |
+| `grid_balance < -surplus_threshold_kw` | Command battery to discharge at `min(deficit, 50 kW)` |
+| Any asset in `FAULT` state | Log critical alert (escalation is external) |
+
+Alert codes in aggregated telemetry: `GRID_SURPLUS`, `GRID_DEFICIT`, `ASSET_FAULT`.
+
+---
+
+## Engineering Design
+
+### Reliability — Retry with Exponential Backoff
+
+All network calls (telemetry publish, twin update) are wrapped with `with_retry()` from `shared/iot_edge_base/retry.py`.
+
+**Strategy:** Full jitter — `delay = random.uniform(0, min(max_delay, base * 2^attempt))`
+
+This is the AWS-recommended approach to prevent **thundering herd**: when many edge devices reconnect simultaneously, randomized delays spread the load over time instead of creating synchronized retry storms.
+
+```python
+await with_retry(
+    lambda: client.send_message_to_output(telemetry.to_dict(), output_name="telemetry"),
+    max_attempts=3,
+    base_delay_s=1.0,
+    max_delay_s=30.0,
+    label="solar.send_telemetry",
+)
+```
+
+Retries are **idempotent**:
+- `update_reported_properties` — Azure IoT Hub twin is a state store (last-write-wins merge); sending the same patch twice has no side effects
+- `send_message_to_output` — each message carries a stable `message_id` (UUID v4); downstream consumers can use it for deduplication
+
+### Runtime Type Safety — Pydantic
+
+Two layers of Pydantic validation protect system boundaries:
+
+**1. Configuration (`pydantic-settings` BaseSettings)**
+
+Each module declares its configuration as a `BaseSettings` class. Environment variables are read and validated at startup — a misconfigured deployment fails immediately with a precise error instead of silently misbehaving at runtime.
+
+```python
+class BatteryConfig(BaseSettings):
+    asset_id: str = "battery-01"
+    capacity_kwh: float = Field(500.0, gt=0)
+    initial_soc: float = Field(0.5, ge=0.0, le=1.0)   # 0–100% SoC
+    telemetry_interval_s: int = Field(10, ge=1)
+
+cfg = BatteryConfig()  # reads env vars, validates constraints
+```
+
+**2. DirectMethod payloads (Pydantic BaseModel)**
+
+Payload schemas are defined in `src/schemas.py` in each module. Validation happens at the `handle_method` boundary, before any asset driver code runs.
+
+```python
+# modules/battery-module/src/schemas.py
+class StartChargingPayload(BaseModel):
+    power_kw: float | None = Field(None, gt=0.0)  # optional — defaults to max_power_kw
+
+# main.py dispatch handler
+parsed = StartChargingPayload.model_validate(payload)
+# ValidationError → 400 with structured error detail
+# RuntimeError (wrong state) → 409
+```
+
+### SOLID Design Principles
+
+| Principle | Implementation |
+|-----------|----------------|
+| **SRP** | Config, payload schemas, telemetry, and state machine are separate classes/files |
+| **OCP** | Dispatch dict in `_build_dispatch()` — adding a method means adding one entry, no existing code changes |
+| **LSP** | `BatteryStorage` never overrides `BaseAsset.state`; CHARGING/DISCHARGING live in `.mode` (sub-state) |
+| **DIP** | All env var reading is isolated in `Config` classes; `BaseEdgeClient` is an abstract interface with Azure and local MQTT implementations |
 
 ---
 
@@ -223,20 +346,20 @@ infra/
 ├── main.bicep              # Orchestrates all modules
 ├── main.bicepparam         # Environment parameters
 └── modules/
-    ├── iot-hub.bicep        # S1 IoT Hub + consumer groups
+    ├── iot-hub.bicep        # S1/S2 IoT Hub + consumer groups
     ├── container-registry.bicep  # ACR for module images
-    ├── log-analytics.bicep  # Log Analytics Workspace
-    └── monitor.bicep        # Diagnostic settings + alerts
+    ├── log-analytics.bicep  # Log Analytics Workspace (30/90 day retention)
+    └── monitor.bicep        # Diagnostic settings + email alerts
 ```
 
 **Deployed resources:**
 
 | Resource | Purpose |
 |----------|---------|
-| Azure IoT Hub (S1) | Device management, telemetry ingestion, direct methods |
+| Azure IoT Hub (S1/S2) | Device management, telemetry ingestion, direct methods |
 | Azure Container Registry | Store Docker images for edge modules |
 | Log Analytics Workspace | Central log aggregation |
-| Azure Monitor Alerts | Alert on asset faults, connectivity loss |
+| Azure Monitor Alerts | Alert on asset faults, IoT Hub errors |
 
 ---
 
@@ -246,31 +369,50 @@ infra/
 energy-edge-controller/
 ├── modules/
 │   ├── solar-module/
+│   │   ├── main.py              # Entry point: lifecycle, handlers, telemetry loop
+│   │   ├── src/
+│   │   │   ├── config.py        # SolarConfig — pydantic-settings BaseSettings
+│   │   │   ├── inverter.py      # SolarInverter state machine + physics simulation
+│   │   │   ├── schemas.py       # SetOutputPayload — boundary validation
+│   │   │   └── simulator.py     # Irradiance model
+│   │   ├── tests/
+│   │   │   └── unit/
+│   │   ├── Dockerfile
+│   │   └── pyproject.toml
+│   ├── battery-module/
 │   │   ├── main.py
 │   │   ├── src/
-│   │   │   ├── inverter.py     # State machine + physics
-│   │   │   └── simulator.py    # Irradiance model
-│   │   ├── tests/
-│   │   │   ├── unit/
-│   │   │   └── integration/
-│   │   ├── Dockerfile
-│   │   └── requirements*.txt
-│   ├── battery-module/
+│   │   │   ├── config.py        # BatteryConfig
+│   │   │   ├── battery.py       # BatteryStorage: state machine + SoC simulation
+│   │   │   └── schemas.py       # StartChargingPayload, StartDischargingPayload
+│   │   └── tests/
+│   │       └── unit/
+│   │           ├── test_battery.py
+│   │           └── test_retry.py
 │   ├── boiler-module/
-│   ├── controller-module/
+│   │   ├── main.py
 │   │   └── src/
-│   │       ├── aggregator.py   # Telemetry aggregation
-│   │       ├── dispatcher.py   # Command dispatch
-│   │       └── registry.py     # Asset state registry
+│   │       ├── config.py        # BoilerConfig
+│   │       ├── boiler.py        # Boiler: temperature control + PID-like simulation
+│   │       └── schemas.py       # SetTemperaturePayload (ge=40, le=120)
+│   ├── controller-module/
+│   │   ├── main.py
+│   │   └── src/
+│   │       ├── config.py        # ControllerConfig (reads IOTEDGE_DEVICEID)
+│   │       ├── aggregator.py    # Telemetry aggregation + grid alerts
+│   │       ├── dispatcher.py    # Command dispatch to asset modules
+│   │       └── registry.py      # In-memory asset state registry
 │   └── telemetry-module/
 ├── shared/
-│   └── iot_edge_base/          # Shared base classes (installed in each module)
-│       ├── asset.py            # BaseAsset, AssetState
-│       ├── client.py           # IoTClient abstraction (prod + local dev)
-│       └── telemetry.py        # Base telemetry dataclass
+│   └── iot_edge_base/           # Shared package — installed in every module via pip
+│       ├── asset.py             # BaseAsset, AssetState — lifecycle state machine
+│       ├── client.py            # BaseEdgeClient: AzureEdgeClient + LocalMqttEdgeClient
+│       ├── retry.py             # with_retry() — exponential backoff with full jitter
+│       └── telemetry.py         # BaseTelemetry
 ├── deployment/
-│   ├── deployment.template.json  # IoT Edge deployment manifest
-│   └── docker-compose.yml        # Local development
+│   ├── deployment.template.json # IoT Edge deployment manifest
+│   ├── docker-compose.yml       # Local dev — Mosquitto MQTT broker + all modules
+│   └── mosquitto.conf
 ├── infra/
 │   ├── main.bicep
 │   ├── main.bicepparam
@@ -285,6 +427,7 @@ energy-edge-controller/
 │       └── deploy.yml
 ├── azure-pipelines.yml
 ├── ARCHITECTURE.md
+├── CICD.md
 └── README.md
 ```
 
@@ -292,37 +435,21 @@ energy-edge-controller/
 
 ## CI/CD Pipeline (Azure DevOps)
 
+See [CICD.md](CICD.md) for the full pipeline documentation.
+
 ```
 PR / push to main
       │
       ▼
 ┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
 │  Test Stage  │────▶│  Build Stage │────▶│  Deploy Stage   │
-│             │     │              │     │  (main only)    │
-│ pytest      │     │ docker build │     │                 │
-│ coverage    │     │ ACR push     │     │ AzureIoTEdge@2  │
-│ lint        │     │             │     │ deployment      │
-│ (parallel   │     │ (parallel   │     │ manifest deploy │
-│  per module)│     │  per module)│     │                 │
+│  (always)   │     │              │     │  (main only)    │
+│             │     │              │     │                 │
+│ pytest      │     │ az acr build │     │ az iot edge     │
+│ coverage    │     │ (no local    │     │ set-modules     │
+│ ruff lint   │     │  Docker      │     │                 │
+│ (parallel   │     │  daemon)     │     │ Manual approval │
+│  per module)│     │ (parallel    │     │ for prod        │
+│             │     │  per module) │     │                 │
 └─────────────┘     └──────────────┘     └─────────────────┘
-```
-
----
-
-## Local Development
-
-```bash
-# Start all modules locally with a mock MQTT broker
-docker compose -f deployment/docker-compose.yml up
-
-# Run tests for a single module
-cd modules/solar-module
-pip install -r requirements-dev.txt
-pytest tests/ --cov=src --cov-report=term-missing
-
-# Deploy infrastructure
-az deployment group create \
-  --resource-group rg-energy-edge \
-  --template-file infra/main.bicep \
-  --parameters infra/main.bicepparam
 ```
